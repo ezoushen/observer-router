@@ -4,6 +4,41 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-09-20 — agent conventions and upstream research
+
+### Added
+
+- **`AGENTS.md`** — conventions for coding agents: commands, layout, code and documentation
+  rules, the markdown style, production-safety rules, and the eight open owner decisions
+  recorded so they are not rediscovered or acted on unreviewed.
+- **`docs/plans/`** — durable plans, with an index. First plan: a proposal for one declared
+  provider-resolution seam in claude-mem, including a ready-to-file draft, its evidence pack,
+  risks, and the decision points that block it.
+- **`docs/researches/2026-09-20-claude-mem-provider-extensibility-survey.md`** — the seventh
+  investigation record. It surveys all 42 open issues and 183 open pull requests for a model
+  selection policy, and finds the override point largely already exists while multi-account
+  rotation is already in flight as PR #3941.
+- **`.markdownlint.json`** — the repository's markdown rules: 100-column prose, tables, code
+  blocks and headings exempt, sibling-only duplicate headings.
+
+### Changed
+
+- **`README.md`** documentation table now lists `docs/plans/` and `AGENTS.md`.
+- **The vendored 2026-09-15 report was rewrapped** to the repository's 100-column convention.
+  Its wording is unchanged — the reproduced body matches the source word-for-word, 864 of 864
+  tokens in order, with all 27 links identical.
+- **The provenance note for that document was corrected.** It previously claimed the file was
+  byte-for-byte identical, which stopped being true once the wrapping was normalised.
+
+### Fixed
+
+- **Markdown lint is now clean.** `markdownlint-cli2` reported 15 errors, all line-length, all
+  in the unwrapped vendored document. Wrapping them fixed the file and, in the process, exposed
+  two real bugs in an earlier wrapping attempt: `textwrap` broke inside link text, making a
+  line begin with `#3829` and render as a heading, and a first pass left commas orphaned at line
+  starts. Both are now guarded by checking that the word sequence and link sequence survive
+  wrapping unchanged.
+
 ## 2026-09-20 — documentation restructure
 
 ### Changed
@@ -19,7 +54,7 @@ carries them.
 
 ### Added
 
-- **`docs/researches/`** — six dated investigation records with their evidence and dead ends:
+- **`docs/researches/`** — dated investigation records with their evidence and dead ends:
   the upstream claude-mem fallback review, the 2026-09-18 chain verification, the local-lane
   OOM diagnosis, the YaRN-vs-KV-memory result, the claude-mem retry and quota limits, and the
   router memory profile. Includes an index of questions answered.

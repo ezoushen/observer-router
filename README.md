@@ -210,7 +210,9 @@ including that an unreadable power source keeps the local tier available.
 | Where | What |
 | --- | --- |
 | [`docs/researches/`](docs/researches/) | Investigations and measurements behind these rules, including dead ends |
+| [`docs/plans/`](docs/plans/) | Durable plans awaiting an owner decision or execution |
 | [`docs/journals/`](docs/journals/) | Dated work log, append-only |
+| [`AGENTS.md`](AGENTS.md) | Conventions for coding agents, plus the open owner decisions |
 | [`CHANGELOG.md`](CHANGELOG.md) | Notable changes to the repository |
 
 ## Scope

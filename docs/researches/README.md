@@ -15,12 +15,18 @@ here records what was found. They cross-link.
 | 2026-09-19 | [YaRN vs KV memory](2026-09-19-yarn-vs-kv-memory.md) | Would a longer positional window let the character guard be relaxed? (No.) |
 | 2026-09-20 | [claude-mem retry and quota limits](2026-09-20-claude-mem-retry-and-quota-limits.md) | Are the free quotas enough, and does skipping the local tier lose work? (No, and no.) |
 | 2026-09-20 | [Router memory profile](2026-09-20-observer-router-memory-profile.md) | Does the router leak under oversized payloads? (No.) |
+| 2026-09-20 | [Provider and routing extensibility survey](2026-09-20-claude-mem-provider-extensibility-survey.md) | Does claude-mem expose a model selection policy, and is multi-account rotation already filed? |
 
 ## Provenance
 
-The 2026-09-15 document is reproduced verbatim from a research report produced in the wider
-personal workspace before this repository existed. It was kept byte-for-byte so the citations
-stay verifiable; only this index describes where it came from.
+The 2026-09-15 document is reproduced from a research report produced in the wider personal
+workspace before this repository existed. Its wording is unchanged: the reproduced body matches
+the source word-for-word (864 of 864 tokens, in order) and all 27 links are identical.
+
+What was normalised, and nothing else: line wrapping to this repository's 100-column convention,
+a trailing-space hard break replaced by a blank paragraph break, and a closing
+"Why this matters here" section added to connect the finding to this project. The original file
+in the wider workspace is untouched.
 
 ## What belongs here
 

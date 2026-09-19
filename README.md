@@ -5,41 +5,42 @@ survives a dead local lane. One process, standard library only, on `127.0.0.1:12
 
 ## Why this exists
 
-claude-mem resolves exactly one provider and has no cross-provider fallback in its own code
-(its `fallback` strings are the cmem.ai Pro tier and the chroma search strategy). On
-2026-09-18 the local observer lane `:1243` hit a Metal GPU OOM that killed its generation
-thread while the HTTP layer kept answering `/v1/models`, so the process stayed "alive" to
-launchd, `KeepAlive` never fired, and every observer call timed out for ~2 hours — 84
-consecutive failures and no memories saved.
+claude-mem resolves exactly one provider and has no cross-provider fallback of its own, so a
+dead lane silently breaks observation. The local lane can keep answering `/v1/models` after
+its generation thread is gone, which means the process still looks alive to launchd and
+`KeepAlive` never fires.
 
 The router removes that single point of failure by putting two remote hops in front of the
 lane, treating any tier that returns no content as a failed attempt, and bounding every
-request before any provider sees it. The remote tiers are capacity, not guarantees: both
-free quotas were exhausted under real observer traffic on 2026-09-19.
+request before any provider sees it. The remote tiers are capacity, not guarantees — see
+[Known limitations](#known-limitations).
+
+Routing belongs here rather than in claude-mem: upstream reviewed a provider chain, declined
+it as premature, and shipped OpenRouter-only model fallback that stops at the OpenRouter
+boundary. See [the upstream research](docs/researches/2026-09-15-claude-mem-provider-fallback-upstream.md).
 
 ## Chain
 
 | Order | Upstream | Model | Budget to first content | Notes |
 | ---: | --- | --- | ---: | --- |
-| 1 | `generativelanguage.googleapis.com/v1beta/openai` | `gemini-flash-lite-latest` | 18 s | Primary hop. Verified 200 in under 1 s when healthy |
+| 1 | `generativelanguage.googleapis.com/v1beta/openai` | `gemini-flash-lite-latest` | 18 s | Primary hop; fast when healthy |
 | 2 | `openrouter.ai/api/v1` | `openrouter/free` (Free Models Router) | 24 s | Auto-selects among ~28 free variants; `prompt=0 completion=0`, 200k ctx |
 | 3 | `127.0.0.1:1243/v1` | your local model id (`OBSERVER_LOCAL_MODEL`) | 70 s | Guaranteed-content backstop; a cache-capped local lane |
 
-Budgets sum to 112 s, under claude-mem's `CLAUDE_MEM_API_TIMEOUT_MS` (120 s).
+Budgets sum to 112 s, under claude-mem's `CLAUDE_MEM_API_TIMEOUT_MS` (120 s). While on battery
+tier 3 is skipped and the remaining budgets still sum under that timeout.
 
-## Tier rules — measured, not assumed
+## Tier behaviour
 
-- **`openrouter/free` returns empty content about half the time.** It rotates across free
-  variants, and a reasoning model spends the whole `max_tokens` budget on `reasoning`
+- **`openrouter/free` can return empty content.** It rotates across free variants, and a
+  reasoning model can spend the whole `max_tokens` budget on `reasoning`
   (`finish_reason: length`, `content: ""`). The router injects
-  `{"reasoning":{"enabled":false}}`, which restored `content="OK", finish_reason=stop` in
-  testing.
-- **That injection can be refused.** One endpoint answered
-  `HTTP 400 "Reasoning is mandatory for this endpoint and cannot be disabled."`, so the
-  router retries the same tier once with `{"reasoning":{"exclude":true}}`.
-- **A tier with no content is a failure, not a result.** Either streaming or non-streaming,
-  an empty answer falls through to the next tier, so claude-mem never records an empty
-  observation.
+  `{"reasoning":{"enabled":false}}`.
+- **That injection can be refused.** An endpoint may answer
+  `HTTP 400 "Reasoning is mandatory for this endpoint and cannot be disabled."`, so the router
+  retries the same tier once with `{"reasoning":{"exclude":true}}`.
+- **A tier with no content is a failure, not a result.** Streaming or not, an empty answer
+  falls through to the next tier, so claude-mem never records an empty observation.
 - **Reasoning deltas are dropped.** Only `delta.content` is forwarded downstream.
 
 ## Streaming contract
@@ -52,31 +53,34 @@ mid-stream failure cannot switch tiers — it is logged and the stream is closed
 
 ## Prompt safety and context folding
 
-Every request is sanitized once before tier selection, so Gemini, OpenRouter, and the local
-lane receive the same bounded conversation:
+Every request is sanitized once before tier selection, so all three tiers receive the same
+bounded conversation:
 
 - OpenAI image parts and `data:image/...;base64,...` payloads become descriptive markers.
 - Contiguous base64-like blobs of at least 16,384 characters become markers.
 - Any remaining field over 80,000 characters keeps its beginning and end around a folding
   marker.
 - If the conversation still exceeds 240,000 characters (roughly 60k tokens), the primary
-  system message and newest non-system message receive first claim on the budget, followed
-  by remaining system messages and recent history. Older messages are dropped last.
+  system message and newest non-system message receive first claim on the budget, followed by
+  remaining system messages and recent history. Older messages are dropped last.
 
 This is deterministic: compaction never calls another model, so it still works when every
 upstream quota is exhausted. `/health` reports cumulative compaction counters and the active
 limits. A log entry records input/output characters, dropped messages, folded fields, images,
 and binary blobs for each changed request.
 
+The guard exists because an unbounded prompt is what actually killed the lane — not a leak.
+See [the diagnosis](docs/researches/2026-09-19-observer-lane-oom-diagnosis.md).
+
 ## Circuit breaker
 
 Three consecutive failures on a tier skip it for 60 s (`OBSERVER_BREAK_AFTER`,
-`OBSERVER_BREAK_SECONDS`). Every failed attempt is logged with its reason, which is how the
-2026-09-18 lane outage was caught within minutes.
+`OBSERVER_BREAK_SECONDS`). Every failed attempt is logged with its reason, so a failing tier
+is visible in the log without reproduction.
 
 ## Power rule — the local tier runs only on AC
 
-The third tier is a GPU workload. With the MacBook unplugged, starting the 4B lane is a poor
+The third tier is a GPU workload. With the MacBook unplugged, starting the lane is a poor
 trade, so the router skips it and names the reason in its failed-chain body:
 
 ```text
@@ -90,14 +94,12 @@ trade, so the router skips it and names the reason in its failed-chain body:
   **stays available** — a failed probe must not take the observer offline.
 - `/health` exposes `power.source`, `power.local_ac_only`, and `power.local_tier_allowed`.
 
-Skipping a tier is only safe because claude-mem retries instead of dropping work, and that
-behavior is verified rather than assumed. On a failed chain it logs
-`Observer failed {kind=quota_exhausted}` and enters a provider quota cooldown, then repeats
-`Skipping generator start while the provider quota cooldown is active {retryInMs=…}` until a
-retry succeeds; the queued batch survives the whole interval. On 2026-09-19 it recorded 75
-such `502` events and still stored observations afterwards. The requeue path is
-`resetProcessingToPending()`, which fires on quota-limit prose, auth failure, and context
-overflow.
+Skipping a tier is only safe because claude-mem retries instead of dropping work. On a failed
+chain it logs `Observer failed {kind=quota_exhausted}`, enters a provider quota cooldown, and
+resumes when the cooldown clears; the requeue path is `resetProcessingToPending()`. One
+caveat: in plugin `13.24.8` the queue is in-memory, so that cushion holds only while the
+worker process stays up. See
+[the retry research](docs/researches/2026-09-20-claude-mem-retry-and-quota-limits.md).
 
 ## Configuration
 
@@ -117,7 +119,8 @@ Overrides (all optional):
 | `OBSERVER_ROUTER_CHAIN` | `gemini,openrouter,local` |
 | `OBSERVER_GEMINI_MODEL` | `gemini-flash-lite-latest` |
 | `OBSERVER_OPENROUTER_MODEL` | `openrouter/free` |
-| `OBSERVER_LOCAL_MODEL` / `OBSERVER_LOCAL_URL` | the 4B observer path / `http://127.0.0.1:1243/v1/chat/completions` |
+| `OBSERVER_LOCAL_MODEL` | `local-model` — set this to your local server's advertised id |
+| `OBSERVER_LOCAL_URL` | `http://127.0.0.1:1243/v1/chat/completions` |
 | `OBSERVER_BREAK_AFTER` / `OBSERVER_BREAK_SECONDS` | `3` / `60` |
 | `OBSERVER_LOCAL_AC_ONLY` | `1` — skip the local tier while on battery |
 | `OBSERVER_POWER_CACHE_SECONDS` | `30` |
@@ -147,7 +150,7 @@ dedicated venv so the service cannot be disturbed by unrelated package installs.
 2. Edit `Label`, both `ProgramArguments` paths, and `PATH` for your machine. Set
    `OBSERVER_LOCAL_MODEL` here as well: it must match the id your local server advertises at
    `/v1/models`, or that tier answers 404 and the chain loses its backstop.
-3. Point claude-mem at the router (see [Consumer contract](#consumer-contract) above).
+3. Point claude-mem at the router, per [Consumer contract](#consumer-contract) above.
 4. Load it and check health:
 
 ```bash
@@ -189,63 +192,32 @@ The suite covers prompt compaction — unchanged small messages, image/base64 st
 bounded history that keeps the system message plus the newest context — and the power gate,
 including that an unreadable power source keeps the local tier available.
 
-## Verification — 2026-09-18
+## Known limitations
 
-| Check | Result |
-| --- | --- |
-| Tier 1, non-streaming and streaming | 200, `gemini-flash-lite-latest`, 0.78–2.2 s |
-| Tier 2 failover (tier 1 broken) | 200, `inclusionai/ling-3.0-flash-vl:free`, 1.45 s |
-| Tier 2 streaming failover | SSE intact, content streamed from `dots-studio/dots-3-note-preview:free` |
-| Tier 3 failover (tiers 1+2 broken) | 200, local Qwen, 0.22 s, streaming and non-streaming |
-| End-to-end via claude-mem | `STORED` memories, `consecutiveFailures: 0` |
-| Production tier mix | 15 served by Gemini, 9 by `openrouter/free` |
-| Gemini failure reasons in production | 2 × HTTP 503 (overloaded), 2 × 18 s read timeout |
-
-The ~37% Gemini fallback rate is the reason tier 2 exists — the primary hop is fast when
-healthy but not always available.
-
-## Verification — 2026-09-19 prompt guard and YaRN experiment
-
-| Check | Result |
-| --- | --- |
-| Unit contract | 3/3 pass: unchanged small messages, image/base64 stripping, bounded history preserving system + newest context |
-| Production-sized failure replay | 3,250,938 input chars → 97 chars; one binary blob removed; HTTP 200 streaming in 2.04 s |
-| Local lane after replay | 200 in 0.21 s; no generation-thread failure |
-| Factor-2 YaRN model view | symlinked weights, independent config with 524,288-token target |
-| MLX YaRN smoke test | `:1245` returned `YARN_OK` in 1.62 s and identified the YaRN model path |
-
-### Why YaRN does not replace this guard
-
-The local model can advertise a longer context than the router forwards, but YaRN changes
-positional encoding, not KV memory: a longer *valid* window does not make the KV allocation
-fit in RAM. A factor-2 YaRN config (`rope_type: yarn`, `factor: 2.0`,
-`original_max_position_embeddings` 262144, 524288 target) was validated in the companion
-runtime project and loaded successfully — but that demonstrates config compatibility only.
-It does not show that a 524k-token request is practical, and static YaRN is known to reduce
-short-context quality. The deterministic character guard described above is what actually
-keeps one request inside the lane's memory budget, and it keeps working when every upstream
-quota is exhausted.
-
-## Known issues and follow-ups
-
-1. **Free remote quotas are too small for daily observer volume.** On 2026-09-19 Gemini had
-   served 471 calls before returning `exceeded your current quota`; OpenRouter returned
-   `free-models-per-day`. The local lane becomes the only tier after both limits expire.
+1. **Free remote quotas are too small for daily observer volume.** Both remote tiers have hard
+   daily caps, so after they expire the local lane is the only tier left. Reducing that
+   dependency means paid Gemini/OpenRouter capacity or a third provider.
 2. **A hung-but-alive local lane still defeats launchd `KeepAlive`.** The prompt guard blocks
-   the observed multi-megabyte trigger, but an unrelated MLX generation-thread failure would
-   still require `launchctl kickstart -k`. Router-triggered restart remains unimplemented.
-3. **The byte cache cap is not enforced in mlx_lm's streaming insertion path.** Sequence
-   count 4 is the effective production bound. The prompt guard prevents a single retained
-   request from approaching the model's 262,144-token native window.
+   the oversized-prompt trigger, but an unrelated MLX generation-thread failure would still
+   need `launchctl kickstart -k`. Router-triggered restart is unimplemented.
+3. **The byte cache cap is not enforced in mlx_lm's streaming insertion path.** Sequence count
+   is the effective production bound on the local lane.
+4. **Cosmetic log noise.** claude-mem client disconnects raise `BrokenPipeError` and
+   `ConnectionResetError` tracebacks in the router log. They are harmless but loud.
+
+## Documentation
+
+| Where | What |
+| --- | --- |
+| [`docs/researches/`](docs/researches/) | Investigations and measurements behind these rules, including dead ends |
+| [`docs/journals/`](docs/journals/) | Dated work log, append-only |
+| [`CHANGELOG.md`](CHANGELOG.md) | Notable changes to the repository |
 
 ## Scope
 
-- This repository owns the router, its launchd plist, its tests, and its journal.
+- This repository owns the router, its launchd plist, its tests, and its documentation.
 - The local tier is any OpenAI-compatible endpoint: the router sends the id
-  `OBSERVER_LOCAL_MODEL` names, so a different model or server works unchanged. The
-  reference lane is a cache-capped MLX server serving a 4B observer model on `:1243`.
+  `OBSERVER_LOCAL_MODEL` names, so a different model or server works unchanged. The reference
+  lane is a cache-capped MLX server serving a 4B observer model on `:1243`.
 - claude-mem is third-party. The router needs only two of its settings,
   `CLAUDE_MEM_OPENROUTER_BASE_URL` and `CLAUDE_MEM_OPENROUTER_MODEL`.
-- The router was extracted from a larger personal workspace. Journal entries were written
-there and are append-only, so a few reference sibling paths that are not part of this
-repository.

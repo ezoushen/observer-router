@@ -1,0 +1,6 @@
+{
+  // Orchestration only. The rules themselves live in .markdownlint.json so that
+  // editors, CI, and `npx markdownlint-cli2` all read the same definition.
+  "globs": ["**/*.md"],
+  "ignores": ["node_modules"]
+}

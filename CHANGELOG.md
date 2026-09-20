@@ -4,6 +4,38 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-09-20 — upstream filing, public repository, pinned lint tooling
+
+### Added
+
+- **Pinned lint tooling.** `package.json` (private, dev-only), `package-lock.json`, and
+  `.markdownlint-cli2.jsonc`. Lint is now one argument-free command, `npm run lint:md`, pinned to
+  markdownlint-cli2 `0.17.2` instead of an ad-hoc `npx` invocation. The rules still live in
+  `.markdownlint.json`, so editors and CI read the same definition. The router itself remains
+  standard-library Python and imports nothing from this tooling.
+- **`npm test`** as a shortcut for the Python suite, so lint and tests share one entry point.
+- `.gitignore` now ignores `node_modules/`.
+
+### Changed
+
+- **The repository is now public.** Before flipping, both the working tree and the full commit
+  history were scanned for credential-shaped strings and committed credential files; both were
+  clean, and the only exposed path component is the owner's username.
+- **The provider-resolution plan is filed.** Posted as a comment on claude-mem
+  [#2785](https://github.com/thedotmack/claude-mem/issues/2785#issuecomment-5747347717)
+  (plan-12, Providers & auth), citing this repository as the reference implementation. The plan's
+  status moved from "proposed" to "filed, awaiting response", and its first two decision points
+  are resolved.
+- **`AGENTS.md`** commands table and open-items table updated to match: visibility resolved, the
+  upstream contribution filed, and lint reachable as a single pinned command.
+
+### Note on the 100-column rule
+
+`MD013` is set to **100 columns**, not the 80 of Google's style guide. Tables, code blocks, and
+headings are exempt, exactly as Google exempts them. 100 is the enforced convention because the
+existing journal entries are append-only and already wrapped at that width — rewrapping them
+would violate the immutability rule that governs the journal.
+
 ## 2026-09-20 — agent conventions and upstream research
 
 ### Added

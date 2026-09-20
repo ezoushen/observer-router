@@ -17,8 +17,9 @@ as production changes.
 
 | Purpose | Command |
 | --- | --- |
-| Tests | `python3 -m unittest -v test_observer_router.py` |
-| Markdown lint | `npx --yes markdownlint-cli2 "**/*.md" "#node_modules"` |
+| Install dev tooling | `npm install` — pinned, needed once |
+| Tests | `npm test`, or `python3 -m unittest -v test_observer_router.py` |
+| Markdown lint | `npm run lint:md` — no arguments; rules live in `.markdownlint.json` |
 | Router health | `curl -fsS http://127.0.0.1:1244/health` |
 | Router models | `curl -fsS http://127.0.0.1:1244/v1/models` |
 | Local lane check | `curl -fsS http://127.0.0.1:1243/v1/models` |
@@ -98,13 +99,16 @@ These are recorded, not started. Do not act on any of them without the owner's a
 
 | # | Item | Status |
 | --- | --- | --- |
-| 1 | **Repository visibility.** `ezoushen/observer-router` is **private**. | Flip to public on request |
+| 1 | **Repository visibility.** `ezoushen/observer-router` is **public**. The working tree and full
+history were scanned for credentials before the flip; both were clean. | Resolved |
 | 2 | **LICENSE.** None added; choosing one is the owner's call. | Not added |
 | 3 | **Project location.** It stays at `~/Workspace/local-llm/observer-router`, ignored by the parent `local-llm` repo. Relocating to a top-level path requires a launchd path change. | Deferred |
 | 4 | **Quota strategy.** Both free remote tiers hit hard daily caps, leaving the local lane load-bearing. Options: paid Gemini/OpenRouter capacity, or a third provider. | Open |
 | 5 | **Breaker-triggered lane restart.** A hung-but-alive MLX lane still defeats launchd `KeepAlive`; router-triggered `launchctl kickstart -k` is unimplemented. | Open |
 | 6 | **Log noise.** claude-mem client disconnects raise `BrokenPipeError` / `ConnectionResetError` tracebacks. Cosmetic, not yet suppressed. | Open |
-| 7 | **Upstream contribution.** A plan proposes one provider-resolution seam for claude-mem; it awaits a decision on the filing route and on citing this repository publicly. | See `docs/plans/` |
+| 7 | **Upstream contribution.** Filed as a comment on claude-mem #2785 (plan-12, Providers &
+auth), citing this repository as the reference implementation. Awaiting a response; a PR is only
+worth scoping if the maintainer accepts the slice. | Filed 2026-09-20 |
 | 8 | **Vendored research provenance.** The 2026-09-15 report is a copy from the wider workspace; the original file is untouched. Kept here as the premise evidence. | Recorded |
 
 ## Upstream facts worth knowing

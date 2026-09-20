@@ -1,7 +1,9 @@
 # Plan — upstream: one declared provider-resolution seam for claude-mem
 
 Date: 2026-09-20
-Status: proposed, awaiting owner decision (see [Decision points](#decision-points))
+Status: filed 2026-09-20 as a comment on
+[#2785](https://github.com/thedotmack/claude-mem/issues/2785#issuecomment-5747347717); awaiting
+the maintainer's response
 Evidence: [Provider extensibility survey](../researches/2026-09-20-claude-mem-provider-extensibility-survey.md)
 
 ## Objective
@@ -173,18 +175,20 @@ folded into #2785 and closed as children, not merged as standalone PRs.
 
 ## Decision points
 
-1. **New issue, comment on #2785, or hold?** (Recommendation: comment on #2785 first; open a new
-   issue only if the maintainer asks for one.)
-2. **May the reference implementation be cited publicly?** It requires flipping
-   `ezoushen/observer-router` to public.
+1. **New issue, comment on #2785, or hold?** — **Resolved:** filed as a comment on #2785, the
+   route the maintainer's own consolidation rounds use for capability asks. A new issue is only
+   worth opening if the maintainer asks for one.
+2. **May the reference implementation be cited publicly?** — **Resolved:** the repository was
+   made public and cited in the comment.
 3. **Is the owner willing to author a PR** if the maintainer accepts the slice? If yes, scope it to
    shape **A** plus tests.
 
 ## Sequencing
 
-1. Owner picks the filing route (decision 1) and citation permission (decision 2).
-2. Post the draft, adjusted for the chosen route.
-3. If accepted: scope shape **A**, open a PR, and use our router as the acceptance fixture.
+1. ~~Owner picks the filing route and citation permission~~ — **done 2026-09-20.**
+2. ~~Post the draft~~ — **done:** comment on #2785.
+3. Awaiting a response. If accepted: scope shape **A**, open a PR, and use this router as the
+   acceptance fixture (decision 3).
 4. Independently, keep using the base-URL seam — nothing here blocks current operation.
 
 ## Verification if upstream implements it

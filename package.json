@@ -1,0 +1,12 @@
+{
+  "name": "observer-router-tooling",
+  "private": true,
+  "description": "Development-only tooling. The router itself is standard-library Python and never imports anything from here.",
+  "scripts": {
+    "lint:md": "markdownlint-cli2",
+    "test": "python3 -m unittest -v test_observer_router.py"
+  },
+  "devDependencies": {
+    "markdownlint-cli2": "0.17.2"
+  }
+}

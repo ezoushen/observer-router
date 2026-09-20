@@ -4,3 +4,6 @@ __pycache__/
 
 # Service logs (the plist writes to /tmp/observer-router.log)
 *.log
+
+# Node tooling (development only: markdownlint)
+node_modules/

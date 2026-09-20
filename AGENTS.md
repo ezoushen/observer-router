@@ -99,16 +99,13 @@ These are recorded, not started. Do not act on any of them without the owner's a
 
 | # | Item | Status |
 | --- | --- | --- |
-| 1 | **Repository visibility.** `ezoushen/observer-router` is **public**. The working tree and full
-history were scanned for credentials before the flip; both were clean. | Resolved |
+| 1 | **Repository visibility.** `ezoushen/observer-router` is **public**. The working tree and the full commit history were scanned for credentials before the flip; both were clean, and the only exposed path component is the owner's username. | Resolved |
 | 2 | **LICENSE.** None added; choosing one is the owner's call. | Not added |
 | 3 | **Project location.** It stays at `~/Workspace/local-llm/observer-router`, ignored by the parent `local-llm` repo. Relocating to a top-level path requires a launchd path change. | Deferred |
 | 4 | **Quota strategy.** Both free remote tiers hit hard daily caps, leaving the local lane load-bearing. Options: paid Gemini/OpenRouter capacity, or a third provider. | Open |
 | 5 | **Breaker-triggered lane restart.** A hung-but-alive MLX lane still defeats launchd `KeepAlive`; router-triggered `launchctl kickstart -k` is unimplemented. | Open |
 | 6 | **Log noise.** claude-mem client disconnects raise `BrokenPipeError` / `ConnectionResetError` tracebacks. Cosmetic, not yet suppressed. | Open |
-| 7 | **Upstream contribution.** Filed as a comment on claude-mem #2785 (plan-12, Providers &
-auth), citing this repository as the reference implementation. Awaiting a response; a PR is only
-worth scoping if the maintainer accepts the slice. | Filed 2026-09-20 |
+| 7 | **Upstream contribution.** Filed as a comment on claude-mem #2785 (plan-12, Providers & auth), citing this repository as the reference implementation. Awaiting a response; a PR is only worth scoping if the maintainer accepts the slice. | Filed 2026-09-20 |
 | 8 | **Vendored research provenance.** The 2026-09-15 report is a copy from the wider workspace; the original file is untouched. Kept here as the premise evidence. | Recorded |
 
 ## Upstream facts worth knowing

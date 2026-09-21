@@ -64,7 +64,7 @@ LOG_PREFIX = "[observer-router]"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 LOCAL_URL = os.environ.get(
-    "OBSERVER_LOCAL_URL", "http://127.0.0.1:1243/v1/chat/completions"
+    "OBSERVER_LOCAL_URL", "http://127.0.0.1:1240/v1/chat/completions"
 )
 
 GEMINI_MODEL = os.environ.get("OBSERVER_GEMINI_MODEL", "gemini-flash-lite-latest")
@@ -73,6 +73,9 @@ OPENROUTER_MODEL = os.environ.get("OBSERVER_OPENROUTER_MODEL", "openrouter/free"
 # mismatch is a 404, which silently leaves the chain without a backstop. Machine-specific
 # ids therefore belong in the deployment (the launchd plist here), not in this default.
 LOCAL_MODEL = os.environ.get("OBSERVER_LOCAL_MODEL", "local-model")
+# Empty string disables the parameter for lanes that reject it (mlx_lm rejects
+# unknown fields). "none" is what Splash accepts to switch thinking off.
+LOCAL_REASONING_EFFORT = os.environ.get("OBSERVER_LOCAL_REASONING_EFFORT", "none").strip()
 
 # Per-tier budget for reaching the first content delta. The sum stays under
 # claude-mem's CLAUDE_MEM_API_TIMEOUT_MS (120s) with headroom for queuing.
@@ -459,6 +462,12 @@ def _payload_for(tier: str, body: dict, reasoning_mode: str | None) -> dict:
     for key in ("temperature", "max_tokens", "top_p", "stop"):
         if body.get(key) is not None:
             payload[key] = body[key]
+    if tier == "local" and LOCAL_REASONING_EFFORT:
+        # Splash honours reasoning_effort and ignores chat_template_kwargs entirely.
+        # Without this a reasoning model spends the whole max_tokens budget thinking
+        # and returns content=None with finish_reason=length, which the router then
+        # reports as "empty content" and the chain loses its backstop.
+        payload["reasoning_effort"] = LOCAL_REASONING_EFFORT
     if tier == "openrouter" and reasoning_mode == "disabled":
         # Without this, reasoning models burn the whole budget on reasoning and
         # return empty content.

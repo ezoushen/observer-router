@@ -77,6 +77,29 @@ LOCAL_MODEL = os.environ.get("OBSERVER_LOCAL_MODEL", "local-model")
 # unknown fields). "none" is what Splash accepts to switch thinking off.
 LOCAL_REASONING_EFFORT = os.environ.get("OBSERVER_LOCAL_REASONING_EFFORT", "none").strip()
 
+# The local tier is one GPU lane. ThreadingHTTPServer will happily run two
+# upstream calls at once, and two concurrent prefills on the same lane both
+# slow down and inflate its KV pool -- the pool has to be sized for the
+# concurrency, not for the request. claude-mem already sets
+# CLAUDE_MEM_MAX_CONCURRENT_AGENTS=1, but nothing here enforced it, so any
+# second caller on :1244 would have broken that assumption silently.
+# Only the local tier is serialised; gemini and openrouter are remote and
+# hold no GPU.
+LOCAL_SERIAL = os.environ.get("OBSERVER_LOCAL_SERIAL", "1").strip() not in ("", "0", "false")
+_LOCAL_LANE_LOCK = threading.Lock()
+
+
+class _NullGuard:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def local_lane_guard(tier: str):
+    """Hold the lane for the duration of a local-tier call."""
+    if tier == "local" and LOCAL_SERIAL:
+        return _LOCAL_LANE_LOCK
+    return _NullGuard()
+
 # Per-tier budget for reaching the first content delta. The sum stays under
 # claude-mem's CLAUDE_MEM_API_TIMEOUT_MS (120s) with headroom for queuing.
 BUDGETS = {"gemini": 18.0, "openrouter": 24.0, "local": 70.0}
@@ -619,6 +642,11 @@ def iter_stream(tier: str, body: dict, budget: float, deadline: float):
     content delta, so the caller can still fall through to the next tier.
     """
     reasoning_mode = "disabled" if tier == "openrouter" else None
+    with local_lane_guard(tier):
+        yield from _iter_stream_locked(tier, body, budget, deadline, reasoning_mode)
+
+
+def _iter_stream_locked(tier, body, budget, deadline, reasoning_mode):
     response = _open_with_reasoning_retry(
         tier, body, _budget_left(budget, deadline), reasoning_mode
     )
@@ -655,15 +683,16 @@ def iter_stream(tier: str, body: dict, budget: float, deadline: float):
 def nonstream(tier: str, body: dict, budget: float, deadline: float):
     """Return (response_dict, content) for a tier, or raise TierFailure."""
     reasoning_mode = "disabled" if tier == "openrouter" else None
-    response = _open_with_reasoning_retry(
-        tier, body, _budget_left(budget, deadline), reasoning_mode
-    )
-    try:
-        payload = json.load(response)
-    except Exception as error:
-        raise TierFailure(f"{tier}: unreadable response: {error}") from error
-    finally:
-        response.close()
+    with local_lane_guard(tier):
+        response = _open_with_reasoning_retry(
+            tier, body, _budget_left(budget, deadline), reasoning_mode
+        )
+        try:
+            payload = json.load(response)
+        except Exception as error:
+            raise TierFailure(f"{tier}: unreadable response: {error}") from error
+        finally:
+            response.close()
     choice = (payload.get("choices") or [{}])[0]
     content = ((choice.get("message") or {}).get("content") or "").strip()
     if not content:

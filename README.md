@@ -10,10 +10,10 @@ dead lane silently breaks observation. The local lane can keep answering `/v1/mo
 its generation thread is gone, which means the process still looks alive to launchd and
 `KeepAlive` never fires.
 
-The router removes that single point of failure by putting two remote hops in front of the
-lane, treating any tier that returns no content as a failed attempt, and bounding every
-request before any provider sees it. The remote tiers are capacity, not guarantees — see
-[Known limitations](#known-limitations).
+The router removes that single point of failure by putting two remote hops, plus an optional
+Cursor bridge, in front of the lane, treating any tier that returns no content as a failed
+attempt, and bounding every request before any provider sees it. The remote tiers are
+capacity, not guarantees — see [Known limitations](#known-limitations).
 
 Routing belongs here rather than in claude-mem: upstream reviewed a provider chain, declined
 it as premature, and shipped OpenRouter-only model fallback that stops at the OpenRouter
@@ -25,10 +25,17 @@ boundary. See [the upstream research](docs/researches/2026-09-15-claude-mem-prov
 | ---: | --- | --- | ---: | --- |
 | 1 | `generativelanguage.googleapis.com/v1beta/openai` | `gemini-flash-lite-latest` | 18 s | Primary hop; fast when healthy |
 | 2 | `openrouter.ai/api/v1` | `openrouter/free` (Free Models Router) | 24 s | Auto-selects among ~28 free variants; `prompt=0 completion=0`, 200k ctx |
-| 3 | `127.0.0.1:1243/v1` | your local model id (`OBSERVER_LOCAL_MODEL`) | 70 s | Guaranteed-content backstop; a cache-capped local lane |
+| 3 (opt-in) | `127.0.0.1:8765/v1` ([cursor-api-proxy] bridge) | `composer-2.5` | 40 s | Cursor subscription models; remote compute, runs on battery |
+| 4 | `127.0.0.1:1243/v1` | your local model id (`OBSERVER_LOCAL_MODEL`) | 70 s | Guaranteed-content backstop; a cache-capped local lane |
 
-Budgets sum to 112 s, under claude-mem's `CLAUDE_MEM_API_TIMEOUT_MS` (120 s). While on battery
-tier 3 is skipped and the remaining budgets still sum under that timeout.
+The default chain is `gemini,openrouter,local`; the cursor tier joins only when
+`OBSERVER_ROUTER_CHAIN` names it, because the bridge is a separate install. Without it the
+budgets sum to 112 s, under claude-mem's `CLAUDE_MEM_API_TIMEOUT_MS` (120 s). With it they sum
+to 152 s, so a chain in which every tier hangs to its budget outlives that timeout; raise the
+timeout to at least 160 s when enabling the cursor tier. While on battery the local tier is
+skipped and the remaining budgets sum to 82 s.
+
+[cursor-api-proxy]: https://github.com/anyrobert/cursor-api-proxy
 
 ## Tier behaviour
 
@@ -42,6 +49,12 @@ tier 3 is skipped and the remaining budgets still sum under that timeout.
 - **A tier with no content is a failure, not a result.** Streaming or not, an empty answer
   falls through to the next tier, so claude-mem never records an empty observation.
 - **Reasoning deltas are dropped.** Only `delta.content` is forwarded downstream.
+- **The cursor tier authenticates to the bridge, not to Cursor.** The key is
+  `OBSERVER_CURSOR_API_KEY`, or else the `CURSOR_BRIDGE_API_KEY` line of the bridge's own env
+  file named by `OBSERVER_CURSOR_ENV_FILE`, so the secret has one copy. No key fails the tier.
+- **An observer skip looks like a failure.** claude-mem's prompt asks for an empty response
+  when a tool call is routine. A tier that obeys returns empty content, so the next tier runs
+  and may record what the first one skipped.
 
 ## Streaming contract
 
@@ -78,9 +91,24 @@ Three consecutive failures on a tier skip it for 60 s (`OBSERVER_BREAK_AFTER`,
 `OBSERVER_BREAK_SECONDS`). Every failed attempt is logged with its reason, so a failing tier
 is visible in the log without reproduction.
 
+A 429 that states when its quota resets skips the tier until then instead:
+
+- **Gemini** names the exhausted quotas in `google.rpc.QuotaFailure`. Any `PerDay` quota
+  blocks the tier until the next midnight Pacific, when Gemini's daily quotas reset.
+  Otherwise the tier waits for `google.rpc.RetryInfo.retryDelay`, which Google sends even for a
+  daily quota and so is only trusted without one.
+- **OpenRouter** sends `X-RateLimit-Reset` in epoch milliseconds, in the headers and again in
+  the body's `error.metadata`. The free tier's daily limit resets at 00:00 UTC.
+- A reset that is unreadable, already past, or more than 26 hours out falls back to the
+  ordinary breaker, so a malformed header cannot take a tier offline for days.
+- A shorter breaker skip never cuts a quota block short, and the next success clears it.
+
+The block is logged once with its reset time, named in the failed-chain `attempted` array, and
+reported in `/health` as `breaker.<tier>.reason`.
+
 ## Power rule — the local tier runs only on AC
 
-The third tier is a GPU workload. With the MacBook unplugged, starting the lane is a poor
+The local tier is a GPU workload. With the MacBook unplugged, starting the lane is a poor
 trade, so the router skips it and names the reason in its failed-chain body:
 
 ```text
@@ -101,6 +129,28 @@ caveat: in plugin `13.24.8` the queue is in-memory, so that cushion holds only w
 worker process stays up. See
 [the retry research](docs/researches/2026-09-20-claude-mem-retry-and-quota-limits.md).
 
+## Idle rule — the local tier waits for interactive lanes
+
+The local lane shares the GPU with any interactive lanes on the same machine. Set
+`OBSERVER_LOCAL_IDLE_METRICS` to those lanes' Prometheus `/metrics` URLs, comma-separated, and
+the local tier runs only once every one of them has been idle for
+`OBSERVER_LOCAL_IDLE_SECONDS` (30 s). Unset, the gate is off.
+
+- A lane is active while `submitted − completed − cancelled − failed` is above zero, or when
+  its submitted counter moved since the previous sample. The second rule catches a request that
+  started and finished between samples.
+- A background thread samples every `OBSERVER_IDLE_SAMPLE_SECONDS` (2 s). The grace period
+  covers the pause an agent loop takes between requests while its tools run.
+- The gate is read when the request arrives and again just before the local tier runs, because
+  the tiers ahead of it can take tens of seconds.
+- An unreachable or unreadable lane is not activity: it ages into idle, so a stopped lane cannot
+  keep the observer offline.
+- A skipped tier is named in the failed-chain body, for example
+  `local(skipped: lanes busy (127.0.0.1:1240, idle 30s required))`, and claude-mem retries
+  after its cooldown, as with the power rule.
+- A local call already running is not interrupted when a lane becomes active.
+- `/health` reports `idle_gate.seconds_since_active` per lane and `idle_gate.local_tier_allowed`.
+
 ## Configuration
 
 Read from claude-mem's settings at startup and re-read whenever the file changes, so keys
@@ -119,11 +169,17 @@ Overrides (all optional):
 | `OBSERVER_ROUTER_CHAIN` | `gemini,openrouter,local` |
 | `OBSERVER_GEMINI_MODEL` | `gemini-flash-lite-latest` |
 | `OBSERVER_OPENROUTER_MODEL` | `openrouter/free` |
+| `OBSERVER_CURSOR_URL` | `http://127.0.0.1:8765/v1/chat/completions` |
+| `OBSERVER_CURSOR_MODEL` | `composer-2.5` |
+| `OBSERVER_CURSOR_API_KEY` | empty — the bridge's `CURSOR_BRIDGE_API_KEY` |
+| `OBSERVER_CURSOR_ENV_FILE` | empty — env file read for `CURSOR_BRIDGE_API_KEY` |
 | `OBSERVER_LOCAL_MODEL` | `local-model` — set this to your local server's advertised id |
 | `OBSERVER_LOCAL_URL` | `http://127.0.0.1:1243/v1/chat/completions` |
 | `OBSERVER_BREAK_AFTER` / `OBSERVER_BREAK_SECONDS` | `3` / `60` |
 | `OBSERVER_LOCAL_AC_ONLY` | `1` — skip the local tier while on battery |
 | `OBSERVER_POWER_CACHE_SECONDS` | `30` |
+| `OBSERVER_LOCAL_IDLE_METRICS` | empty — gate off; comma-separated `/metrics` URLs of lanes to wait for |
+| `OBSERVER_LOCAL_IDLE_SECONDS` / `OBSERVER_IDLE_SAMPLE_SECONDS` | `30` / `2` |
 | `OBSERVER_MAX_PROMPT_CHARS` / `OBSERVER_MAX_FIELD_CHARS` | `240000` / `80000` |
 | `OBSERVER_MIN_RETAINED_CHARS` | `1024` |
 | `OBSERVER_BASE64_BLOB_CHARS` | `16384` |
@@ -169,7 +225,7 @@ unloaded, and `KeepAlive` cannot bring back a job that is no longer registered.
 | launchd label | `com.ezou.observer-router` |
 | plist | `~/Library/LaunchAgents/com.ezou.observer-router.plist` (copy kept here) |
 | log | `/tmp/observer-router.log` |
-| health | `curl -fsS http://127.0.0.1:1244/health` — chain, budgets, breaker, prompt guard, power/AC gate |
+| health | `curl -fsS http://127.0.0.1:1244/health` — chain, budgets, breaker and quota blocks, prompt guard, power/AC gate, idle gate |
 | models | `curl -fsS http://127.0.0.1:1244/v1/models` |
 
 Exercise one tier in isolation by starting a throwaway instance with the earlier tiers broken:
@@ -189,14 +245,17 @@ python3 -m unittest -v test_observer_router.py
 ```
 
 The suite covers prompt compaction — unchanged small messages, image/base64 stripping, and
-bounded history that keeps the system message plus the newest context — and the power gate,
-including that an unreadable power source keeps the local tier available.
+bounded history that keeps the system message plus the newest context — the power gate,
+including that an unreadable power source keeps the local tier available, and the cursor tier's
+key resolution, payload, and exemption from the power gate and lane lock — and quota-reset
+parsing for both remote tiers, against the 429 shapes they actually return — and the idle gate:
+in-flight parsing, the grace period, activity between samples, and unreadable lanes.
 
 ## Known limitations
 
 1. **Free remote quotas are too small for daily observer volume.** Both remote tiers have hard
-   daily caps, so after they expire the local lane is the only tier left. Reducing that
-   dependency means paid Gemini/OpenRouter capacity or a third provider.
+   daily caps, so after they expire the local lane is the only tier left unless the cursor
+   tier is enabled.
 2. **A hung-but-alive local lane still defeats launchd `KeepAlive`.** The prompt guard blocks
    the oversized-prompt trigger, but an unrelated MLX generation-thread failure would still
    need `launchctl kickstart -k`. Router-triggered restart is unimplemented.

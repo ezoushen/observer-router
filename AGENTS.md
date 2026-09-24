@@ -6,7 +6,8 @@ Project instructions for coding agents. `README.md` is for humans and states wha
 ## What this repository is
 
 One standard-library Python process that serves an OpenAI-compatible API on `127.0.0.1:1244` and
-fronts claude-mem's observer calls with a Gemini Flash → OpenRouter free → local MLX lane chain.
+fronts claude-mem's observer calls with a Gemini Flash → OpenRouter free → optional Cursor bridge →
+local lane chain.
 It exists because claude-mem resolves exactly one provider and has no cross-provider fallback, so
 a dead local lane silently breaks observation.
 
@@ -34,7 +35,7 @@ see the Operations section of `README.md`.
 | Path | Contents |
 | --- | --- |
 | `observer-router.py` | The router. Single file, no third-party imports. |
-| `test_observer_router.py` | Unit tests for prompt compaction and the power gate. |
+| `test_observer_router.py` | Unit tests for compaction, the power and idle gates, the cursor tier, and quota blocks. |
 | `com.ezou.observer-router.plist` | launchd deployment, and the home of machine-specific values. |
 | `docs/researches/` | Investigations: question, method, evidence, conclusion. |
 | `docs/plans/` | Durable plans awaiting or undergoing execution. |
@@ -102,7 +103,7 @@ These are recorded, not started. Do not act on any of them without the owner's a
 | 1 | **Repository visibility.** `ezoushen/observer-router` is **public**. The working tree and the full commit history were scanned for credentials before the flip; both were clean, and the only exposed path component is the owner's username. | Resolved |
 | 2 | **LICENSE.** None added; choosing one is the owner's call. | Not added |
 | 3 | **Project location.** It stays at `~/Workspace/local-llm/observer-router`, ignored by the parent `local-llm` repo. Relocating to a top-level path requires a launchd path change. | Deferred |
-| 4 | **Quota strategy.** Both free remote tiers hit hard daily caps, leaving the local lane load-bearing. Options: paid Gemini/OpenRouter capacity, or a third provider. | Open |
+| 4 | **Quota strategy.** Both free remote tiers hit hard daily caps, leaving the local lane load-bearing. A third provider, the opt-in `cursor` tier (Composer through a local cursor-api-proxy bridge), landed 2026-09-24. | Third provider added |
 | 5 | **Breaker-triggered lane restart.** A hung-but-alive MLX lane still defeats launchd `KeepAlive`; router-triggered `launchctl kickstart -k` is unimplemented. | Open |
 | 6 | **Log noise.** claude-mem client disconnects raise `BrokenPipeError` / `ConnectionResetError` tracebacks. Cosmetic, not yet suppressed. | Open |
 | 7 | **Upstream contribution.** Filed as a comment on claude-mem #2785 (plan-12, Providers & auth), citing this repository as the reference implementation. Awaiting a response; a PR is only worth scoping if the maintainer accepts the slice. | Filed 2026-09-20 |

@@ -4,6 +4,29 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-09-24 — cursor tier, quota-reset blocks, and the idle gate
+
+### Added
+
+- **Idle gate for the local tier.** `OBSERVER_LOCAL_IDLE_METRICS` lists interactive lanes'
+  `/metrics` URLs; the local tier runs only after all of them have been idle for
+  `OBSERVER_LOCAL_IDLE_SECONDS` (30 s), read from Splash's request counters by a 2 s sampler.
+  Off when unset. An unreadable lane ages into idle.
+
+- **Quota-reset blocks.** A Gemini or OpenRouter 429 that states its reset skips the tier until
+  then, instead of re-probing it every 60 s. Gemini `PerDay` quotas block until midnight
+  Pacific, other Gemini quotas for `retryDelay`, and OpenRouter until `X-RateLimit-Reset`.
+  `/health` reports the reason per tier. Error bodies are now read up to 16 KiB, because
+  Gemini names its quota well past the old 300-character cut, and a body read for the
+  reasoning-retry check no longer comes back empty for the log line.
+
+- **`cursor` tier.** An OpenAI-compatible hop to a local cursor-api-proxy bridge
+  (`OBSERVER_CURSOR_URL`, default `127.0.0.1:8765`) serving `composer-2.5`
+  (`OBSERVER_CURSOR_MODEL`), with a 40 s budget. It is opt-in through `OBSERVER_ROUTER_CHAIN`
+  and sits before the local lane. The bridge key comes from `OBSERVER_CURSOR_API_KEY` or the
+  `CURSOR_BRIDGE_API_KEY` line of `OBSERVER_CURSOR_ENV_FILE`. It is remote compute, so it runs
+  on battery and does not take the local lane lock.
+
 ## 2026-09-20 — upstream filing, public repository, pinned lint tooling
 
 ### Added

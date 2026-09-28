@@ -19,9 +19,9 @@
 #
 # Common fields: type, model, url (defaults for gemini and openrouter), budget_s (seconds to the
 # first content delta; defaults gemini 18, openrouter 24, openai 40), api_key_env, api_key_file,
-# api_key_var. The sum of the budgets should stay under the client's timeout (claude-mem:
-# CLAUDE_MEM_API_TIMEOUT_MS, 120 s by default); this example sums to 170 s, so trim the chain
-# or raise that timeout to at least 180 s.
+# api_key_var. The sum of the budgets should stay under the client's per-request timeout
+# (claude-mem 13.28: CLAUDE_MEM_LLM_TIMEOUT_MS, 30 s by default, at most 300 s); this example
+# sums to 170 s, so trim the chain or set that timeout to at least 180000.
 
 chain = ["gemini-a", "gemini-b", "openrouter", "cursor", "local"]
 

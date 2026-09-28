@@ -35,10 +35,12 @@ may share a type — two Gemini keys, say, each with its own breaker and quota b
 
 The reference deployment runs `gemini` (`gemini-flash-lite-latest`) → `openrouter`
 (`openrouter/free`) → `cursor` (`composer-2.5` through a [cursor-api-proxy] bridge on `:8765`, 40
-s) → `local` (an MLX/Splash lane, 70 s). Keep the budgets' sum under the client's timeout:
-claude-mem's `CLAUDE_MEM_API_TIMEOUT_MS` defaults to 120 s, and that four-instance chain sums to
-152 s, so a chain in which every instance hangs to its budget outlives it. Raise the timeout to at
-least 160 s for that chain.
+s) → `local` (an MLX/Splash lane, 70 s). Keep the budgets' sum under the client's per-request
+timeout. For claude-mem (13.28) that is `CLAUDE_MEM_LLM_TIMEOUT_MS`, the per-attempt deadline of
+an observer call: 30 s by default, at most 300 s. `CLAUDE_MEM_API_TIMEOUT_MS` is unrelated; it
+bounds calls to claude-mem's own worker API. The four-instance chain sums to 152 s, so with the
+default a slow chain is cut off after 30 s and the later instances never answer; set
+`CLAUDE_MEM_LLM_TIMEOUT_MS` to at least 160000 for that chain.
 
 [cursor-api-proxy]: https://github.com/anyrobert/cursor-api-proxy
 

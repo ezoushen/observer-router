@@ -21,3 +21,15 @@
   reasoning retry) and was served by the cursor bridge in 17.6 s.
 - References: `config.example.toml`, `test_observer_router.py` (`ConfigTests`,
   `RequestBuildingTests`, `ChainTests`).
+
+## 01:30 — Keys move into the router's own secrets file; the client timeout is corrected
+
+- Outcome: the Gemini and OpenRouter keys were copied from claude-mem's settings into
+  `~/.config/observer-router/secrets.env` (mode 600) by a script that never printed them, and the
+  live config now points there. A comparison that printed only booleans confirmed both resolve to
+  the same values. The cursor bridge key stays in the bridge's own file.
+- Outcome: in claude-mem 13.28.0, `CLAUDE_MEM_API_TIMEOUT_MS` bounds calls to the worker's own
+  HTTP API. The observer's LLM deadline is `CLAUDE_MEM_LLM_TIMEOUT_MS` (default 30 s, clamped to
+  500 ms–300 s, read on each call). README and the example config named the wrong setting and were
+  corrected.
+- References: `worker-service.cjs` in the 13.28.0 plugin cache (`eIt`, `u0e`).

@@ -62,7 +62,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -251,7 +251,9 @@ def _read_lane(url: str) -> tuple[int, int] | None:
 
 def watched_lanes() -> tuple[str, ...]:
     """Every /metrics URL an active provider in the chain waits on."""
-    return tuple(dict.fromkeys(url for name in CHAIN for url in PROVIDERS[name].idle_metrics))
+    return tuple(dict.fromkeys(
+        url for name in chain_providers() for url in PROVIDERS[name].idle_metrics
+    ))
 
 
 def _sample_lanes_forever() -> None:
@@ -282,7 +284,7 @@ def busy_reason(provider) -> str | None:
 def idle_snapshot() -> dict:
     now = time.time()
     snapshot = {}
-    for name in CHAIN:
+    for name in chain_providers():
         provider = PROVIDERS[name]
         if not provider.idle_metrics:
             continue
@@ -300,16 +302,18 @@ def idle_snapshot() -> dict:
     return snapshot
 
 
-def allowed_tiers() -> tuple[list[str], dict[str, str]]:
-    """Split CHAIN into the providers worth trying and the ones skipped, with a reason each.
+def allowed_tiers(order: list[str] | None = None) -> tuple[list[str], dict[str, str]]:
+    """Split a request's provider order (by default, the next expand_chain()) into the providers
+    worth trying and the ones skipped, with a reason each.
 
     Skipped providers are reported in the failed-chain response so claude-mem's cooldown log
     explains why a local lane never ran.
     """
+    order = expand_chain() if order is None else order
     allowed: list[str] = []
     skipped: dict[str, str] = {}
-    on_battery = any(PROVIDERS[name].ac_only for name in CHAIN) and power_source() == "Battery Power"
-    for name in CHAIN:
+    on_battery = any(PROVIDERS[name].ac_only for name in order) and power_source() == "Battery Power"
+    for name in order:
         provider = PROVIDERS[name]
         if provider.ac_only and on_battery:
             skipped[name] = "skipped: on battery (AC-only)"
@@ -327,7 +331,7 @@ def power_snapshot() -> dict:
     source = power_source()
     return {
         "source": source,
-        "ac_only": [name for name in CHAIN if PROVIDERS[name].ac_only],
+        "ac_only": [name for name in chain_providers() if PROVIDERS[name].ac_only],
         "ac_only_allowed": source != "Battery Power",
     }
 
@@ -391,7 +395,9 @@ class Provider:
 @dataclass(frozen=True)
 class Config:
     providers: dict[str, Provider]
+    # Entries name a provider or a group; a group rotates its members (see expand_chain).
     chain: tuple[str, ...]
+    groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def _http_url(value) -> bool:
@@ -467,26 +473,66 @@ def _provider(name: str, table) -> Provider:
 
 
 def parse_config(data: dict) -> Config:
-    unknown = set(data) - {"chain", "providers"}
+    unknown = set(data) - {"chain", "providers", "groups"}
     if unknown:
         raise ConfigError(f"unknown top-level key(s): {', '.join(sorted(unknown))}")
     tables = data.get("providers") or {}
     if not isinstance(tables, dict) or not tables:
         raise ConfigError("config defines no [providers.<name>] tables")
     providers = {name: _provider(name, table) for name, table in tables.items()}
+    groups = _groups(data.get("groups", {}), providers)
     chain = data.get("chain", list(providers))
     if not isinstance(chain, list) or not chain or not all(isinstance(n, str) for n in chain):
-        raise ConfigError("chain must be a non-empty list of provider names")
-    return Config(providers, _checked_chain(chain, providers, "chain"))
+        raise ConfigError("chain must be a non-empty list of provider or group names")
+    return Config(providers, _checked_chain(chain, providers, groups, "chain"), groups)
 
 
-def _checked_chain(names, providers: dict, source: str) -> tuple[str, ...]:
+def _names(where: str, names, providers: dict) -> tuple[str, ...]:
     unknown = [name for name in names if name not in providers]
     if unknown:
-        raise ConfigError(f"{source} names undefined provider(s): {', '.join(unknown)}")
+        raise ConfigError(f"{where} names undefined provider(s): {', '.join(unknown)}")
     repeated = sorted({name for name in names if names.count(name) > 1})
     if repeated:
-        raise ConfigError(f"{source} repeats provider(s): {', '.join(repeated)}")
+        raise ConfigError(f"{where} repeats provider(s): {', '.join(repeated)}")
+    return tuple(names)
+
+
+def _groups(tables, providers: dict) -> dict[str, tuple[str, ...]]:
+    """Parse [groups.<name>] tables. Members are providers only; a group cannot nest."""
+    if not isinstance(tables, dict):
+        raise ConfigError("groups must be [groups.<name>] tables")
+    groups = {}
+    for name, table in tables.items():
+        where = f"groups.{name}"
+        if name in providers:
+            raise ConfigError(f"{where}: the name is already a provider")
+        if not isinstance(table, dict):
+            raise ConfigError(f"{where} must be a table")
+        unknown = set(table) - {"members"}
+        if unknown:
+            raise ConfigError(f"{where}: unknown field(s): {', '.join(sorted(unknown))}")
+        members = table.get("members")
+        if not isinstance(members, list) or not members or not all(
+            isinstance(member, str) for member in members
+        ):
+            raise ConfigError(f"{where}: members must be a non-empty list of provider names")
+        groups[name] = _names(where, members, providers)
+    return groups
+
+
+def _checked_chain(names, providers: dict, groups: dict, source: str) -> tuple[str, ...]:
+    unknown = [name for name in names if name not in providers and name not in groups]
+    if unknown:
+        raise ConfigError(
+            f"{source} names undefined provider(s) or group(s): {', '.join(unknown)}"
+        )
+    expanded = [member for name in names for member in groups.get(name, (name,))]
+    repeated = sorted({name for name in expanded if expanded.count(name) > 1})
+    if repeated:
+        raise ConfigError(
+            f"{source} would try provider(s) more than once, directly or through a group: "
+            f"{', '.join(repeated)}"
+        )
     return tuple(names)
 
 
@@ -502,11 +548,11 @@ def load_config(path: str) -> Config:
 
 
 def chain_override(config: Config, text: str) -> tuple[str, ...]:
-    """Apply OBSERVER_ROUTER_CHAIN: a comma-separated list of provider names, or empty."""
+    """Apply OBSERVER_ROUTER_CHAIN: comma-separated provider or group names, or empty."""
     names = [name.strip() for name in text.split(",") if name.strip()]
     if not names:
         return config.chain
-    return _checked_chain(names, config.providers, "OBSERVER_ROUTER_CHAIN")
+    return _checked_chain(names, config.providers, config.groups, "OBSERVER_ROUTER_CHAIN")
 
 
 # Environment variables that configured providers before the config file existed. Setting one
@@ -525,13 +571,44 @@ def stale_environment(env) -> list[str]:
 # The active configuration. main() fills these; they stay empty until then so importing the
 # module (the tests do) never reads a config file.
 PROVIDERS: dict[str, Provider] = {}
+GROUPS: dict[str, tuple[str, ...]] = {}
 CHAIN: tuple[str, ...] = ()
+_rotation_lock = threading.Lock()
+_rotation: dict[str, int] = {}
 
 
 def configure(config: Config, chain: tuple[str, ...] | None = None) -> None:
-    global PROVIDERS, CHAIN
+    global PROVIDERS, GROUPS, CHAIN
     PROVIDERS = dict(config.providers)
+    GROUPS = dict(config.groups)
     CHAIN = tuple(chain or config.chain)
+    with _rotation_lock:
+        _rotation.clear()
+
+
+def chain_providers() -> list[str]:
+    """Every provider the chain can reach, in configured order, groups flattened."""
+    return [member for name in CHAIN for member in GROUPS.get(name, (name,))]
+
+
+def expand_chain() -> list[str]:
+    """Return this request's provider order.
+
+    Each group starts one member further on than it did for the previous request, so load
+    rotates across its keys; the remaining members follow in order, so a failing or quota-blocked
+    member still falls over inside the group before the chain moves on.
+    """
+    order = []
+    with _rotation_lock:
+        for name in CHAIN:
+            members = GROUPS.get(name)
+            if members is None:
+                order.append(name)
+                continue
+            start = _rotation.get(name, 0) % len(members)
+            _rotation[name] = start + 1
+            order += members[start:] + members[:start]
+    return order
 
 
 # --- prompt safety ------------------------------------------------------------
@@ -776,7 +853,7 @@ def breaker_snapshot() -> dict:
                 "skipped_for_s": round(max(0.0, _skip_until.get(name, 0.0) - now), 1),
                 "reason": _skip_reason.get(name, "") if _skip_until.get(name, 0.0) > now else "",
             }
-            for name in CHAIN
+            for name in chain_providers()
         }
 
 
@@ -1220,10 +1297,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._json(200, {
                 "status": "ok",
                 "chain": list(CHAIN),
+                "groups": {name: list(GROUPS[name]) for name in CHAIN if name in GROUPS},
                 "providers": {
                     name: {"type": PROVIDERS[name].type, "model": PROVIDERS[name].model,
                            "budget_s": PROVIDERS[name].budget}
-                    for name in CHAIN
+                    for name in chain_providers()
                 },
                 "breaker": breaker_snapshot(),
                 "prompt_guard": compaction_snapshot(),
@@ -1268,18 +1346,19 @@ class RouterHandler(BaseHTTPRequestHandler):
                 f"removed_blobs={compacted['removed_blobs']}"
             )
 
-        allowed, _ = allowed_tiers()
+        order = expand_chain()  # once per request: every expansion advances the group rotation
+        allowed, _ = allowed_tiers(order)
         deadline = time.time() + sum(PROVIDERS[name].budget for name in allowed) + 5.0
         if body.get("stream"):
-            self._stream(body, deadline)
+            self._stream(body, order, deadline)
         else:
-            self._once(body, deadline)
+            self._once(body, order, deadline)
 
     # --- streaming path -------------------------------------------------------
 
-    def _stream(self, body: dict, deadline: float) -> None:
+    def _stream(self, body: dict, order: list[str], deadline: float) -> None:
         attempted = []
-        allowed, skipped = allowed_tiers()
+        allowed, skipped = allowed_tiers(order)
         for tier, reason in skipped.items():
             attempted.append(f"{tier}({reason})")
         for tier in allowed:
@@ -1335,9 +1414,9 @@ class RouterHandler(BaseHTTPRequestHandler):
 
     # --- non-streaming path ---------------------------------------------------
 
-    def _once(self, body: dict, deadline: float) -> None:
+    def _once(self, body: dict, order: list[str], deadline: float) -> None:
         attempted = []
-        allowed, skipped = allowed_tiers()
+        allowed, skipped = allowed_tiers(order)
         for tier, reason in skipped.items():
             attempted.append(f"{tier}({reason})")
         for tier in allowed:

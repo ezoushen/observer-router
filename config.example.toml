@@ -6,6 +6,11 @@
 # without it the tables' order is used. OBSERVER_ROUTER_CHAIN overrides it at start-up with a
 # comma-separated list of names, e.g. to drop a local lane during a benchmark.
 #
+# A chain entry may also name a [groups.<name>] table. A group rotates: each request starts at
+# the next member in turn, and the remaining members follow, so load spreads across several keys
+# and a failing or quota-blocked member still falls over inside the group before the chain moves
+# on. A provider may appear only once in the chain, directly or through a group.
+#
 # Secrets never go in this file. A provider names where its key lives:
 #   api_key_env  = "NAME"              an environment variable, checked first
 #   api_key_file = "path"              a dotenv-style file (NAME=value), or a JSON object when
@@ -23,7 +28,11 @@
 # (claude-mem 13.28: CLAUDE_MEM_LLM_TIMEOUT_MS, 30 s by default, at most 300 s); this example
 # sums to 170 s, so trim the chain or set that timeout to at least 180000.
 
-chain = ["gemini-a", "gemini-b", "openrouter", "cursor", "local"]
+chain = ["gemini", "openrouter", "cursor", "local"]
+
+# Two Gemini keys taking turns.
+[groups.gemini]
+members = ["gemini-a", "gemini-b"]
 
 [providers.gemini-a]
 type = "gemini"

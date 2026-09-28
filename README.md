@@ -33,6 +33,11 @@ may share a type — two Gemini keys, say, each with its own breaker and quota b
 | `openrouter` | `openrouter.ai/api/v1` | 24 s | Reasoning disabled per request; `X-RateLimit-Reset` blocks the instance |
 | `openai` | any OpenAI-compatible `url` | 40 s | Local lanes and bridges; key optional; the GPU-lane gates live here |
 
+A chain entry may also name a **group** of providers. A group rotates: each request starts at the
+next member in turn and the remaining members follow, so load spreads evenly across several keys,
+and a failing or quota-blocked member still falls over to the others before the chain moves on.
+Mix the two freely — a rotating pool of keys first, then plain fallbacks.
+
 The reference deployment runs `gemini` (`gemini-flash-lite-latest`) → `openrouter`
 (`openrouter/free`) → `cursor` (`composer-2.5` through a [cursor-api-proxy] bridge on `:8765`, 40
 s) → `local` (an MLX/Splash lane, 70 s). Keep the budgets' sum under the client's per-request
@@ -204,7 +209,20 @@ ac_only = true
 | `ac_only` | `openai` | `false` | Skip while on battery |
 | `idle_metrics`, `idle_seconds` | `openai` | none, `30` | Wait for these lanes to be idle first |
 
-`chain` lists instance names in order; without it the tables' order is used. `gemini` and
+`chain` lists provider or group names in order; without it the providers' order is used, and
+groups then go unused. A group
+is a `[groups.<name>]` table with one field, `members`, a list of provider names; its name must not
+also be a provider's, groups do not nest, and no provider may be reachable twice through the chain.
+
+```toml
+chain = ["gemini", "openrouter", "local"]
+
+[groups.gemini]
+members = ["gemini-a", "gemini-b", "gemini-c"]   # request 1 starts at a, request 2 at b, ...
+```
+
+The rotation position is in memory and starts again at the first member after a restart. `/health`
+lists each group's members under `groups`, and every member's breaker under `breaker`. `gemini` and
 `openrouter` instances must name a key source. **Keys never go in the file**: an inline `api_key`
 is rejected, as is any field the instance's type does not know, so a typo cannot be ignored
 silently. Every value is type-checked at start-up (`serial = "false"` is an error, not true), and
@@ -218,7 +236,7 @@ Environment overrides (all optional):
 | Variable | Default |
 | --- | --- |
 | `OBSERVER_ROUTER_CONFIG` | `~/.config/observer-router/config.toml` |
-| `OBSERVER_ROUTER_CHAIN` | the file's `chain` — comma-separated instance names, e.g. to drop a local lane during a benchmark |
+| `OBSERVER_ROUTER_CHAIN` | the file's `chain` — comma-separated provider or group names, e.g. to drop a local lane during a benchmark |
 | `OBSERVER_ROUTER_HOST` / `OBSERVER_ROUTER_PORT` | `127.0.0.1` / `1244` |
 | `OBSERVER_BREAK_AFTER` / `OBSERVER_BREAK_SECONDS` | `3` / `60` |
 | `OBSERVER_POWER_CACHE_SECONDS` | `30` |
@@ -270,7 +288,7 @@ unloaded, and `KeepAlive` cannot bring back a job that is no longer registered.
 | plist | `~/Library/LaunchAgents/com.ezou.observer-router.plist` (copy kept here) |
 | log | `/tmp/observer-router.log` |
 | config | `~/.config/observer-router/config.toml` |
-| health | `curl -fsS http://127.0.0.1:1244/health` — chain, instances, breaker and quota blocks, prompt guard, power/AC gate, idle gate |
+| health | `curl -fsS http://127.0.0.1:1244/health` — chain, groups, instances, breaker and quota blocks, prompt guard, power/AC gate, idle gate |
 | models | `curl -fsS http://127.0.0.1:1244/v1/models` |
 
 Exercise one instance in isolation by starting a throwaway router whose chain names only it:
@@ -286,10 +304,12 @@ OBSERVER_ROUTER_PORT=1247 OBSERVER_ROUTER_CHAIN=cursor python3 observer-router.p
 python3 -m unittest -v test_observer_router.py
 ```
 
-The suite covers config loading and validation (named instances, type defaults, the chain and
-its override, and rejection of inline keys, unknown fields and undefined names), per-instance
+The suite covers config loading and validation (named instances, type defaults, groups and their
+rotation, the chain and its override, and rejection of inline keys, unknown fields, undefined
+names, and providers reachable twice), per-instance
 request building (key sources, attribution headers, reasoning fields, lane locks), failover
-between two instances of one type through the real HTTP handler against fake upstreams, prompt
+between two instances of one type and rotation across a group's members, through the real HTTP
+handler against fake upstreams, prompt
 compaction, the power and idle gates, and quota-reset parsing against the 429 shapes Gemini and
 OpenRouter actually return.
 

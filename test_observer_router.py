@@ -55,6 +55,34 @@ model = "local-model"
 """
 
 
+POOL = """
+chain = ["pool", "local"]
+
+[providers.a]
+type = "openai"
+url = "http://127.0.0.1:9/a"
+model = "m"
+
+[providers.b]
+type = "openai"
+url = "http://127.0.0.1:9/b"
+model = "m"
+
+[providers.c]
+type = "openai"
+url = "http://127.0.0.1:9/c"
+model = "m"
+
+[providers.local]
+type = "openai"
+url = "http://127.0.0.1:9/local"
+model = "m"
+
+[groups.pool]
+members = ["a", "b", "c"]
+"""
+
+
 class ConfigTests(unittest.TestCase):
     """The config file defines named provider instances and the order they are tried in."""
 
@@ -160,7 +188,46 @@ class ConfigTests(unittest.TestCase):
     def test_the_shipped_example_is_a_valid_config(self):
         config = router.load_config(str(MODULE_PATH.with_name("config.example.toml")))
 
-        self.assertEqual(config.chain, ("gemini-a", "gemini-b", "openrouter", "cursor", "local"))
+        self.assertEqual(config.chain, ("gemini", "openrouter", "cursor", "local"))
+        self.assertEqual(config.groups["gemini"], ("gemini-a", "gemini-b"))
+
+    def test_a_group_rotates_its_members_across_requests(self):
+        config = _config(POOL)
+        router.configure(config)
+        try:
+            orders = [router.expand_chain() for _ in range(4)]
+        finally:
+            router.configure(router.Config({}, ()))
+
+        self.assertEqual(config.chain, ("pool", "local"))
+        self.assertEqual(config.groups["pool"], ("a", "b", "c"))
+        self.assertEqual(orders, [
+            ["a", "b", "c", "local"],
+            ["b", "c", "a", "local"],
+            ["c", "a", "b", "local"],
+            ["a", "b", "c", "local"],
+        ])
+
+    def test_invalid_groups_are_rejected_with_the_reason(self):
+        providers = POOL.split("[groups.pool]")[0].replace('chain = ["pool", "local"]', "")
+        cases = {
+            "unknown member": ('[groups.g]\nmembers = ["a", "zz"]\n', "zz"),
+            "empty members": ('[groups.g]\nmembers = []\n', "members"),
+            "repeated member": ('[groups.g]\nmembers = ["a", "a"]\n', "repeats"),
+            "unknown field": ('[groups.g]\nmembers = ["a"]\nstrategy = "random"\n', "strategy"),
+            "groups not a table": ('groups = []\n', "groups must be"),
+            "name taken by a provider": ('[groups.a]\nmembers = ["b"]\n', "groups.a"),
+            "group inside a group": ('[groups.g]\nmembers = ["a"]\n[groups.h]\nmembers = ["g"]\n',
+                                     "groups.h"),
+            "member also in the chain": ('chain = ["g", "a"]\n[groups.g]\nmembers = ["a", "b"]\n',
+                                         "more than once"),
+        }
+        for label, (text, needle) in cases.items():
+            with self.subTest(label):
+                chain = "" if text.startswith("chain") else 'chain = ["g"]\n'
+                with self.assertRaises(router.ConfigError) as caught:
+                    _config(chain + text + providers)
+                self.assertIn(needle, str(caught.exception))
 
     def test_removed_environment_variables_are_named(self):
         stale = router.stale_environment({"OBSERVER_LOCAL_URL": "x", "OBSERVER_ROUTER_PORT": "1",
@@ -824,6 +891,52 @@ class ChainTests(ActiveConfigTestCase):
         self.assertTrue(attempted[0].startswith("gemini-a("), attempted)
         self.assertTrue(attempted[1].startswith("gemini-b("), attempted)
         self.assertIn("empty content", attempted[1])
+
+    def _pool(self, first: FakeUpstream, second: FakeUpstream, fallback: FakeUpstream) -> None:
+        router.configure(router.parse_config({
+            "chain": ["pool", "fallback"],
+            "providers": {
+                "gemini-a": {"type": "gemini", "url": first.url, "model": "model-a",
+                             "api_key_env": "TEST_GEMINI_A"},
+                "gemini-b": {"type": "gemini", "url": second.url, "model": "model-b",
+                             "api_key_env": "TEST_GEMINI_B"},
+                "fallback": {"type": "openai", "url": fallback.url, "model": "f"},
+            },
+            "groups": {"pool": {"members": ["gemini-a", "gemini-b"]}},
+        }))
+
+    def test_a_group_spreads_consecutive_requests_across_its_members(self):
+        first = self._upstream(body=_completion("from a"))
+        second = self._upstream(body=_completion("from b"))
+        fallback = self._upstream(body=_completion("fallback"))
+        self._pool(first, second, fallback)
+
+        answers = [json.loads(self._post({"messages": [{"role": "user", "content": "hi"}]})[1])
+                   ["choices"][0]["message"]["content"] for _ in range(4)]
+
+        self.assertEqual(sorted(answers), ["from a", "from a", "from b", "from b"])
+        self.assertEqual(fallback.requests, [])
+
+    def test_a_failing_member_retries_inside_the_group_before_falling_back(self):
+        first = self._upstream(status=503, body={"error": "down"})
+        second = self._upstream(body=_completion("from b"))
+        fallback = self._upstream(body=_completion("fallback"))
+        self._pool(first, second, fallback)
+
+        answers = [json.loads(self._post({"messages": [{"role": "user", "content": "hi"}]})[1])
+                   ["choices"][0]["message"]["content"] for _ in range(2)]
+
+        self.assertEqual(answers, ["from b", "from b"])
+        self.assertEqual(fallback.requests, [])
+
+    def test_health_reports_groups_and_their_members(self):
+        self._pool(self._upstream(body={}), self._upstream(body={}), self._upstream(body={}))
+
+        health = self._get_health()
+
+        self.assertEqual(health["chain"], ["pool", "fallback"])
+        self.assertEqual(health["groups"], {"pool": ["gemini-a", "gemini-b"]})
+        self.assertEqual(set(health["breaker"]), {"gemini-a", "gemini-b", "fallback"})
 
     def test_health_lists_each_instance_in_chain_order(self):
         self._two_geminis(self._upstream(body={}), self._upstream(body={}))

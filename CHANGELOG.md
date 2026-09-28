@@ -4,6 +4,15 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-09-29 — rotating provider groups
+
+### Added
+
+- **`[groups.<name>]`** with `members = [...]`. A chain entry naming a group rotates across its
+  members: each request starts one member further on, and the others follow as in-group
+  fallbacks before the chain moves on. `/health` reports `groups`. A provider may be reachable
+  only once through the chain.
+
 ## 2026-09-29 — config file with named provider instances
 
 ### Changed

@@ -1,0 +1,69 @@
+# observer-router configuration.
+#
+# Copy to ~/.config/observer-router/config.toml (or point OBSERVER_ROUTER_CONFIG elsewhere).
+# Each [providers.<name>] table is one upstream instance; several may share a type, and each
+# has its own circuit breaker and quota block. `chain` is the order they are tried in, by name;
+# without it the tables' order is used. OBSERVER_ROUTER_CHAIN overrides it at start-up with a
+# comma-separated list of names, e.g. to drop a local lane during a benchmark.
+#
+# Secrets never go in this file. A provider names where its key lives:
+#   api_key_env  = "NAME"              an environment variable, checked first
+#   api_key_file = "path"              a dotenv-style file (NAME=value), or a JSON object when
+#   api_key_var  = "NAME"              the path ends in .json; re-read on every request
+# An inline api_key is rejected.
+#
+# Types:
+#   gemini      Google's OpenAI-compatible endpoint; daily-quota 429s block until midnight Pacific
+#   openrouter  OpenRouter; reasoning is disabled per request, X-RateLimit-Reset blocks the tier
+#   openai      any OpenAI-compatible endpoint (a local lane, a bridge); url required, key optional
+#
+# Common fields: type, model, url (defaults for gemini and openrouter), budget_s (seconds to the
+# first content delta; defaults gemini 18, openrouter 24, openai 40), api_key_env, api_key_file,
+# api_key_var. The sum of the budgets should stay under the client's timeout (claude-mem:
+# CLAUDE_MEM_API_TIMEOUT_MS, 120 s by default); this example sums to 170 s, so trim the chain
+# or raise that timeout to at least 180 s.
+
+chain = ["gemini-a", "gemini-b", "openrouter", "cursor", "local"]
+
+[providers.gemini-a]
+type = "gemini"
+model = "gemini-flash-lite-latest"
+api_key_env = "GEMINI_API_KEY_A"
+
+[providers.gemini-b]
+type = "gemini"
+model = "gemini-flash-lite-latest"
+api_key_file = "~/.config/observer-router/secrets.env"
+api_key_var = "GEMINI_API_KEY_B"
+
+[providers.openrouter]
+type = "openrouter"
+model = "openrouter/free"
+api_key_file = "~/.config/observer-router/secrets.env"
+api_key_var = "OPENROUTER_API_KEY"
+# site_url = "https://example.com"   # optional HTTP-Referer attribution
+# app_name = "observer-router"       # X-Title attribution (this is the default)
+
+# A cursor-api-proxy bridge in front of Cursor's subscription models. The key is the bridge's
+# own, read from the bridge's env file so there is one copy of it.
+[providers.cursor]
+type = "openai"
+url = "http://127.0.0.1:8765/v1/chat/completions"
+model = "composer-2.5"
+api_key_file = "~/path/to/cursor-proxy.cfg"
+api_key_var = "CURSOR_BRIDGE_API_KEY"
+budget_s = 40
+
+# A GPU lane on this machine. model must match the id the server advertises at /v1/models.
+[providers.local]
+type = "openai"
+url = "http://127.0.0.1:1240/v1/chat/completions"
+model = "local-model"
+budget_s = 70
+reasoning_effort = "none"   # sent as-is; omit for servers that reject unknown fields (mlx_lm)
+serial = true               # one request at a time per lane URL
+ac_only = true              # skipped while a laptop runs on battery
+# Wait until these interactive lanes' Prometheus /metrics (Splash counters) have been idle for
+# idle_seconds before using this lane.
+# idle_metrics = ["http://127.0.0.1:1241/metrics"]
+# idle_seconds = 30

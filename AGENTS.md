@@ -6,8 +6,9 @@ Project instructions for coding agents. `README.md` is for humans and states wha
 ## What this repository is
 
 One standard-library Python process that serves an OpenAI-compatible API on `127.0.0.1:1244` and
-fronts claude-mem's observer calls with a Gemini Flash → OpenRouter free → optional Cursor bridge →
-local lane chain.
+fronts claude-mem's observer calls with a fallback chain of named provider instances (types
+`gemini`, `openrouter`, `openai`) read from a TOML config file. The reference chain is Gemini Flash
+→ OpenRouter free → Cursor bridge → local lane.
 It exists because claude-mem resolves exactly one provider and has no cross-provider fallback, so
 a dead local lane silently breaks observation.
 
@@ -27,16 +28,17 @@ as production changes.
 | Restart the service | `launchctl bootout gui/$UID/com.ezou.observer-router` then `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.ezou.observer-router.plist` |
 | Service log | `/tmp/observer-router.log` |
 
-Exercise one tier in isolation by starting a throwaway instance with the earlier tiers broken —
-see the Operations section of `README.md`.
+Exercise one provider in isolation with a throwaway router on another port whose
+`OBSERVER_ROUTER_CHAIN` names only it — see the Operations section of `README.md`.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
 | `observer-router.py` | The router. Single file, no third-party imports. |
-| `test_observer_router.py` | Unit tests for compaction, the power and idle gates, the cursor tier, and quota blocks. |
-| `com.ezou.observer-router.plist` | launchd deployment, and the home of machine-specific values. |
+| `test_observer_router.py` | Tests for config loading, request building, chain failover over HTTP, compaction, the power and idle gates, and quota blocks. |
+| `config.example.toml` | The documented config template. The live config is `~/.config/observer-router/config.toml`, outside the repository. |
+| `com.ezou.observer-router.plist` | launchd deployment: interpreter and script paths. |
 | `docs/researches/` | Investigations: question, method, evidence, conclusion. |
 | `docs/plans/` | Durable plans awaiting or undergoing execution. |
 | `docs/journals/` | Dated work log. Append-only. |
@@ -49,9 +51,10 @@ see the Operations section of `README.md`.
 - **Keep prompt compaction deterministic.** It must never call another model, so it still works
   when every upstream quota is exhausted.
 - **Treat an empty tier response as a failure**, never as a result.
-- Every environment knob belongs in the README configuration table, with its default.
-- Machine-specific values (paths, `OBSERVER_LOCAL_MODEL`) belong in the plist, not in code
-  defaults.
+- Every config field and environment knob belongs in the README configuration tables, with its
+  default, and every config field in `config.example.toml`.
+- Machine-specific values (URLs, model ids, key locations) belong in the local config file, not
+  in code defaults or the committed example.
 - New behaviour needs a test in `test_observer_router.py`.
 
 ## Documentation conventions
@@ -89,8 +92,9 @@ see the Operations section of `README.md`.
   oversized request that motivated them. A single oversized prompt is what killed the lane.
 - **The power gate must fail safe.** An unreadable power source keeps the local tier available; a
   failed probe must not take the observer offline.
-- **Never commit credentials.** Settings keys are referenced by name; no value is ever echoed into
-  a document.
+- **Never commit credentials.** The config names where a key lives (`api_key_env`,
+  `api_key_file` + `api_key_var`) and rejects inline keys; no value is ever echoed into a document
+  or a log line.
 - Touching the local lane, its launchd job, or claude-mem's settings is out of scope for this
   repository. Report, do not silently reconfigure.
 
@@ -103,7 +107,7 @@ These are recorded, not started. Do not act on any of them without the owner's a
 | 1 | **Repository visibility.** `ezoushen/observer-router` is **public**. The working tree and the full commit history were scanned for credentials before the flip; both were clean, and the only exposed path component is the owner's username. | Resolved |
 | 2 | **LICENSE.** None added; choosing one is the owner's call. | Not added |
 | 3 | **Project location.** It stays at `~/Workspace/local-llm/observer-router`, ignored by the parent `local-llm` repo. Relocating to a top-level path requires a launchd path change. | Deferred |
-| 4 | **Quota strategy.** Both free remote tiers hit hard daily caps, leaving the local lane load-bearing. A third provider, the opt-in `cursor` tier (Composer through a local cursor-api-proxy bridge), landed 2026-09-24. | Third provider added |
+| 4 | **Quota strategy.** Both free remote tiers hit hard daily caps, leaving the local lane load-bearing. A third provider, the `cursor` bridge, landed 2026-09-24; since 2026-09-29 any number of instances per type (for example several Gemini keys) can be chained. | Multi-instance chain |
 | 5 | **Breaker-triggered lane restart.** A hung-but-alive MLX lane still defeats launchd `KeepAlive`; router-triggered `launchctl kickstart -k` is unimplemented. | Open |
 | 6 | **Log noise.** claude-mem client disconnects raise `BrokenPipeError` / `ConnectionResetError` tracebacks. Cosmetic, not yet suppressed. | Open |
 | 7 | **Upstream contribution.** Filed as a comment on claude-mem #2785 (plan-12, Providers & auth), citing this repository as the reference implementation. Awaiting a response; a PR is only worth scoping if the maintainer accepts the slice. | Filed 2026-09-20 |

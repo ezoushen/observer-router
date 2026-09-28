@@ -7,3 +7,7 @@ __pycache__/
 
 # Node tooling (development only: markdownlint)
 node_modules/
+
+# Local configuration; config.example.toml is the template
+config.toml
+*.env

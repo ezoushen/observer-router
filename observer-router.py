@@ -1,113 +1,85 @@
 #!/usr/bin/env python3
-"""Observer router for claude-mem: Gemini Flash -> OpenRouter Free -> [Cursor] -> local lane.
+"""Observer router: an OpenAI-compatible fallback chain across named provider instances.
 
 claude-mem speaks OpenAI-compatible HTTP and resolves exactly one provider, so the
 fallback chain lives here instead. This process exposes /v1/chat/completions and
-/v1/models on 127.0.0.1:1244 and rewrites every request for whichever tier runs.
+/v1/models on 127.0.0.1:1244 and rewrites every request for whichever provider runs.
 
 Why it exists (2026-09-18): the local observer lane (:1243) hit a Metal GPU OOM,
 its generation thread died while the process kept answering /v1/models, and claude-mem
-timed out on every call for ~2 hours. A healthy remote first hop plus a per-tier
+timed out on every call for ~2 hours. A healthy remote first hop plus a per-provider
 budget removes that single point of failure.
 
-Tier rules, measured rather than assumed:
+Providers come from a TOML config file (OBSERVER_ROUTER_CONFIG, default
+~/.config/observer-router/config.toml; see config.example.toml). Each [providers.<name>] table
+is one instance of a type -- gemini, openrouter, or openai (any OpenAI-compatible endpoint) --
+and several instances may share a type. The chain is an ordered list of instance names, and the
+breaker and quota blocks are kept per instance. Keys are named, never inlined: an environment
+variable or a line in a dotenv/JSON file.
+
+Provider rules, measured rather than assumed:
   * openrouter/free rotates across free variants; roughly half of plain calls return
     EMPTY content because a reasoning model spends the whole max_tokens budget on
     reasoning. We inject {"reasoning":{"enabled":false}} and retry once with
     {"reasoning":{"exclude":true}} when an endpoint answers 400 "Reasoning is
     mandatory for this endpoint and cannot be disabled."
-  * A tier that yields no content counts as a failed attempt and the next tier runs,
+  * A provider that yields no content counts as a failed attempt and the next one runs,
     so an observer call never returns an empty result.
-  * Both free tiers hit daily quotas and say when they reset: Gemini names the quota in
+  * Both free types hit daily quotas and say when they reset: Gemini names the quota in
     google.rpc.QuotaFailure (daily quotas reset at midnight Pacific), OpenRouter sends
-    X-RateLimit-Reset. Such a 429 skips the tier until the reset rather than re-probing
+    X-RateLimit-Reset. Such a 429 skips the instance until the reset rather than re-probing
     it every breaker interval.
-  * The optional cursor tier is a local cursor-api-proxy bridge in front of Cursor's
-    subscription models (Composer by default). It is remote compute, so it runs on
-    battery and needs no lane lock; it is opt-in through OBSERVER_ROUTER_CHAIN because
-    the bridge is a separate install.
 
 Streaming contract: claude-mem sends stream=true. Response headers are only sent once
 the first content-bearing delta arrives, which keeps failover possible until that
 point. Reasoning deltas are dropped; only content is forwarded downstream.
 
-Prompt contract: requests are sanitized once before tier selection. Image payloads and
+Prompt contract: requests are sanitized once before provider selection. Image payloads and
 large base64 blobs are replaced with markers, individual fields are folded, and older
 messages are dropped only when the remaining conversation exceeds the configured character
 budget. System messages and the newest conversation context receive priority. This bounds
 KV allocation without depending on another model call during an outage.
 
-Idle rule: with OBSERVER_LOCAL_IDLE_METRICS set, the local tier also waits until the listed
-interactive lanes have been idle for OBSERVER_LOCAL_IDLE_SECONDS; see the idle gate section.
-
-Power rule: with OBSERVER_LOCAL_AC_ONLY enabled (the default) the local tier is skipped
-while the machine runs on battery, so an unplugged laptop does not start GPU inference as
-a last resort. claude-mem answers a failed chain with a provider quota cooldown and retries
-the same queued batch, so a skipped tier delays observations instead of dropping them. An
-unreadable power state leaves the tier available: a failed probe must not take the observer
-offline. Desktops report AC Power permanently, making this gate inert there.
-
-Configuration is read from claude-mem's settings.json (re-read whenever it changes, so
-keys edited in the claude-mem console are picked up without a restart), with env
-overrides for every value.
+GPU-lane gates, per openai provider: serial = true runs one request at a time per lane URL;
+idle_metrics makes the provider wait until the listed interactive lanes have been idle for
+idle_seconds (see the idle gate section); ac_only = true skips it while the machine runs on
+battery, so an unplugged laptop does not start GPU inference as a last resort. claude-mem
+answers a failed chain with a provider quota cooldown and retries the same queued batch, so a
+skipped provider delays observations instead of dropping them. An unreadable power state
+leaves the provider available: a failed probe must not take the observer offline. Desktops
+report AC Power permanently, making that gate inert there.
 """
 
 from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import re
 import subprocess
 import threading
 import time
+import tomllib
 import urllib.parse
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from urllib.error import HTTPError
 from zoneinfo import ZoneInfo
 
-SETTINGS_PATH = os.environ.get(
-    "CLAUDE_MEM_SETTINGS", os.path.expanduser("~/.claude-mem/settings.json")
-)
 HOST = os.environ.get("OBSERVER_ROUTER_HOST", "127.0.0.1")
 LOG_PREFIX = "[observer-router]"
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-CURSOR_URL = os.environ.get(
-    "OBSERVER_CURSOR_URL", "http://127.0.0.1:8765/v1/chat/completions"
-)
-LOCAL_URL = os.environ.get(
-    "OBSERVER_LOCAL_URL", "http://127.0.0.1:1240/v1/chat/completions"
-)
-
-GEMINI_MODEL = os.environ.get("OBSERVER_GEMINI_MODEL", "gemini-flash-lite-latest")
-OPENROUTER_MODEL = os.environ.get("OBSERVER_OPENROUTER_MODEL", "openrouter/free")
-CURSOR_MODEL = os.environ.get("OBSERVER_CURSOR_MODEL", "composer-2.5")
-# The bridge key lives in the bridge's own env file; reading it from there keeps one
-# copy of the secret, so rotating it in the bridge cannot silently break this tier.
-CURSOR_API_KEY = os.environ.get("OBSERVER_CURSOR_API_KEY", "").strip()
-CURSOR_ENV_FILE = os.path.expanduser(os.environ.get("OBSERVER_CURSOR_ENV_FILE", "").strip())
-# The local tier's model id must match what the local server advertises at /v1/models: a
-# mismatch is a 404, which silently leaves the chain without a backstop. Machine-specific
-# ids therefore belong in the deployment (the launchd plist here), not in this default.
-LOCAL_MODEL = os.environ.get("OBSERVER_LOCAL_MODEL", "local-model")
-# Empty string disables the parameter for lanes that reject it (mlx_lm rejects
-# unknown fields). "none" is what Splash accepts to switch thinking off.
-LOCAL_REASONING_EFFORT = os.environ.get("OBSERVER_LOCAL_REASONING_EFFORT", "none").strip()
-
-# The local tier is one GPU lane. ThreadingHTTPServer will happily run two
-# upstream calls at once, and two concurrent prefills on the same lane both
-# slow down and inflate its KV pool -- the pool has to be sized for the
-# concurrency, not for the request. claude-mem already sets
-# CLAUDE_MEM_MAX_CONCURRENT_AGENTS=1, but nothing here enforced it, so any
-# second caller on :1244 would have broken that assumption silently.
-# Only the local tier is serialised; gemini and openrouter are remote and
-# hold no GPU.
-LOCAL_SERIAL = os.environ.get("OBSERVER_LOCAL_SERIAL", "1").strip() not in ("", "0", "false")
-_LOCAL_LANE_LOCK = threading.Lock()
+# A GPU lane runs one request at a time. ThreadingHTTPServer will happily run two upstream calls
+# at once, and two concurrent prefills on the same lane both slow down and inflate its KV pool --
+# the pool has to be sized for the concurrency, not for the request. claude-mem already sets
+# CLAUDE_MEM_MAX_CONCURRENT_AGENTS=1, but nothing here enforced it, so any second caller on
+# :1244 would have broken that assumption silently. A provider with serial = true takes the
+# lock of its URL, so two instances pointed at one lane share it; remote providers hold no GPU.
+_lane_locks: dict[str, threading.Lock] = {}
+_lane_locks_lock = threading.Lock()
 
 
 class _NullGuard:
@@ -115,16 +87,12 @@ class _NullGuard:
     def __exit__(self, *a): return False
 
 
-def local_lane_guard(tier: str):
-    """Hold the lane for the duration of a local-tier call."""
-    if tier == "local" and LOCAL_SERIAL:
-        return _LOCAL_LANE_LOCK
-    return _NullGuard()
-
-# Per-tier budget for reaching the first content delta. The default chain's sum stays
-# under claude-mem's CLAUDE_MEM_API_TIMEOUT_MS (120s) with headroom for queuing; adding
-# the cursor tier (measured 14-27s per observer call) needs that timeout raised.
-BUDGETS = {"gemini": 18.0, "openrouter": 24.0, "cursor": 40.0, "local": 70.0}
+def lane_guard(provider):
+    """Hold the provider's lane for the duration of a call when it is serial."""
+    if not provider.serial:
+        return _NullGuard()
+    with _lane_locks_lock:
+        return _lane_locks.setdefault(provider.url, threading.Lock())
 
 
 def _env_int(name: str, default: int) -> int:
@@ -165,24 +133,12 @@ MIN_RETAINED_CHARS = _env_int("OBSERVER_MIN_RETAINED_CHARS", 1_024)
 BASE64_BLOB_CHARS = _env_int("OBSERVER_BASE64_BLOB_CHARS", 16_384)
 MAX_ERROR_BODY_BYTES = 16_384
 
-CHAIN = tuple(
-    tier for tier in os.environ.get("OBSERVER_ROUTER_CHAIN", "gemini,openrouter,local").split(",")
-    if tier
-)
-
-
 def log(message: str) -> None:
     print(f"{LOG_PREFIX} [{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
 # --- power source -------------------------------------------------------------
 
-LOCAL_AC_ONLY = os.environ.get("OBSERVER_LOCAL_AC_ONLY", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
 POWER_CACHE_SECONDS = _env_float("OBSERVER_POWER_CACHE_SECONDS", 30.0)
 
 _power_lock = threading.Lock()
@@ -225,21 +181,16 @@ def power_source() -> str:
 
 # --- idle gate ----------------------------------------------------------------
 
-# The local tier shares the GPU with interactive lanes on the same machine. With
-# OBSERVER_LOCAL_IDLE_METRICS naming those lanes' Prometheus /metrics URLs, the local tier
-# runs only after every one of them has been idle for OBSERVER_LOCAL_IDLE_SECONDS, so an
-# observer prefill never competes with a turn the user is waiting on. The grace period
-# matters because an agent loop pauses between requests while its tools run.
+# A local provider shares the GPU with interactive lanes on the same machine. With idle_metrics
+# naming those lanes' Prometheus /metrics URLs, the provider runs only after every one of them
+# has been idle for its idle_seconds, so an observer prefill never competes with a turn the user
+# is waiting on. The grace period matters because an agent loop pauses between requests while
+# its tools run.
 #
 # A background sampler, not a per-request probe, tracks activity: a request that starts and
 # finishes between two observer calls still moves the submitted counter, but only a sampler
 # can say when. An unreadable lane leaves its last reading in place and ages into idle, so a
 # stopped or broken lane cannot keep the observer offline.
-LOCAL_IDLE_METRICS = tuple(
-    url.strip() for url in os.environ.get("OBSERVER_LOCAL_IDLE_METRICS", "").split(",")
-    if url.strip()
-)
-LOCAL_IDLE_SECONDS = _env_float("OBSERVER_LOCAL_IDLE_SECONDS", 30.0)
 IDLE_SAMPLE_SECONDS = _env_float("OBSERVER_IDLE_SAMPLE_SECONDS", 2.0)
 _IN_FLIGHT_COUNTERS = {
     "splash_requests_submitted_total": 1,
@@ -298,60 +249,72 @@ def _read_lane(url: str) -> tuple[int, int] | None:
         connection.close()
 
 
+def watched_lanes() -> tuple[str, ...]:
+    """Every /metrics URL an active provider in the chain waits on."""
+    return tuple(dict.fromkeys(url for name in CHAIN for url in PROVIDERS[name].idle_metrics))
+
+
 def _sample_lanes_forever() -> None:
     while True:
-        for url in LOCAL_IDLE_METRICS:
+        for url in watched_lanes():
             record_lane_sample(url, _read_lane(url), time.time())
         time.sleep(IDLE_SAMPLE_SECONDS)
 
 
-def busy_lanes(now: float | None = None) -> list[str]:
-    """Return the watched lanes active within the last LOCAL_IDLE_SECONDS."""
+def busy_lanes(provider, now: float | None = None) -> list[str]:
+    """Return the provider's watched lanes active within its last idle_seconds."""
     now = time.time() if now is None else now
     with _idle_lock:
         return [
-            url for url in LOCAL_IDLE_METRICS
-            if now - _lane_activity.get(url, {}).get("busy_at", 0.0) < LOCAL_IDLE_SECONDS
+            url for url in provider.idle_metrics
+            if now - _lane_activity.get(url, {}).get("busy_at", 0.0) < provider.idle_seconds
         ]
 
 
-def local_busy_reason() -> str | None:
-    busy = busy_lanes()
+def busy_reason(provider) -> str | None:
+    busy = busy_lanes(provider)
     if not busy:
         return None
     ports = ",".join(urllib.parse.urlsplit(url).netloc for url in busy)
-    return f"skipped: lanes busy ({ports}, idle {LOCAL_IDLE_SECONDS:.0f}s required)"
+    return f"skipped: lanes busy ({ports}, idle {provider.idle_seconds:.0f}s required)"
 
 
 def idle_snapshot() -> dict:
     now = time.time()
-    with _idle_lock:
-        lanes = {
-            url: round(now - _lane_activity[url]["busy_at"], 1)
-            if url in _lane_activity and _lane_activity[url]["busy_at"] else None
-            for url in LOCAL_IDLE_METRICS
+    snapshot = {}
+    for name in CHAIN:
+        provider = PROVIDERS[name]
+        if not provider.idle_metrics:
+            continue
+        with _idle_lock:
+            lanes = {
+                url: round(now - _lane_activity[url]["busy_at"], 1)
+                if url in _lane_activity and _lane_activity[url]["busy_at"] else None
+                for url in provider.idle_metrics
+            }
+        snapshot[name] = {
+            "idle_seconds_required": provider.idle_seconds,
+            "seconds_since_active": lanes,
+            "allowed": not busy_lanes(provider, now),
         }
-    return {
-        "idle_seconds_required": LOCAL_IDLE_SECONDS,
-        "seconds_since_active": lanes,
-        "local_tier_allowed": not busy_lanes(now),
-    }
+    return snapshot
 
 
 def allowed_tiers() -> tuple[list[str], dict[str, str]]:
-    """Split CHAIN into the tiers worth trying and the ones skipped, with a reason each.
+    """Split CHAIN into the providers worth trying and the ones skipped, with a reason each.
 
-    Skipped tiers are reported in the failed-chain response so claude-mem's cooldown log
-    explains why the local lane never ran.
+    Skipped providers are reported in the failed-chain response so claude-mem's cooldown log
+    explains why a local lane never ran.
     """
     allowed: list[str] = []
     skipped: dict[str, str] = {}
-    on_battery = LOCAL_AC_ONLY and power_source() == "Battery Power"
+    on_battery = any(PROVIDERS[name].ac_only for name in CHAIN) and power_source() == "Battery Power"
     for name in CHAIN:
-        if name == "local" and on_battery:
+        provider = PROVIDERS[name]
+        if provider.ac_only and on_battery:
             skipped[name] = "skipped: on battery (AC-only)"
             continue
-        busy = local_busy_reason() if name == "local" else None
+        busy = busy_reason(provider)
         if busy:
             skipped[name] = busy
             continue
@@ -364,32 +327,211 @@ def power_snapshot() -> dict:
     source = power_source()
     return {
         "source": source,
-        "local_ac_only": LOCAL_AC_ONLY,
-        "local_tier_allowed": not (LOCAL_AC_ONLY and source == "Battery Power"),
+        "ac_only": [name for name in CHAIN if PROVIDERS[name].ac_only],
+        "ac_only_allowed": source != "Battery Power",
     }
 
 
-# --- settings -----------------------------------------------------------------
+# --- config -------------------------------------------------------------------
 
-_settings_lock = threading.Lock()
-_settings_cache = {"mtime": None, "data": {}}
+CONFIG_PATH = os.path.expanduser(
+    os.environ.get("OBSERVER_ROUTER_CONFIG", "~/.config/observer-router/config.toml")
+)
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Per-type defaults. "openai" is any OpenAI-compatible endpoint (a local lane, a bridge), so it
+# has no default URL and needs no key; the hosted types always authenticate.
+_TYPE_DEFAULTS = {
+    "gemini": {"url": GEMINI_URL, "budget_s": 18.0},
+    "openrouter": {"url": OPENROUTER_URL, "budget_s": 24.0},
+    "openai": {"url": "", "budget_s": 40.0},
+}
+# Field -> kind. Every value is type-checked at start-up: TOML "false" is a string, and a
+# dataclass would store it and read it as true.
+_COMMON_FIELDS = {
+    "type": "str", "url": "url", "model": "str", "budget_s": "seconds",
+    "api_key_env": "name", "api_key_file": "str", "api_key_var": "name",
+}
+_TYPE_FIELDS = {
+    "gemini": {},
+    "openrouter": {"site_url": "str", "app_name": "str"},
+    # The GPU-lane gates only make sense for a lane on this machine, so only openai has them.
+    "openai": {"reasoning_effort": "str", "serial": "bool", "ac_only": "bool",
+               "idle_metrics": "urls", "idle_seconds": "seconds"},
+}
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
-def settings() -> dict:
-    """Return claude-mem settings, reloading when the file changes on disk."""
-    with _settings_lock:
-        try:
-            mtime = os.stat(SETTINGS_PATH).st_mtime
-        except OSError:
-            return _settings_cache["data"]
-        if mtime != _settings_cache["mtime"]:
-            try:
-                with open(SETTINGS_PATH) as handle:
-                    _settings_cache["data"] = json.load(handle)
-                _settings_cache["mtime"] = mtime
-            except Exception as error:
-                log(f"settings reload failed: {type(error).__name__}: {error}")
-        return _settings_cache["data"]
+class ConfigError(Exception):
+    """The config file is missing, unreadable, or describes an unusable chain."""
+
+
+@dataclass(frozen=True)
+class Provider:
+    """One named upstream instance. Several instances may share a type."""
+
+    name: str
+    type: str
+    url: str
+    model: str
+    budget: float
+    api_key_env: str = ""
+    api_key_file: str = ""
+    api_key_var: str = ""
+    site_url: str = ""
+    app_name: str = "observer-router"
+    reasoning_effort: str = ""
+    serial: bool = False
+    ac_only: bool = False
+    idle_metrics: tuple[str, ...] = ()
+    idle_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
+class Config:
+    providers: dict[str, Provider]
+    chain: tuple[str, ...]
+
+
+def _http_url(value) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(value)
+        parts.port  # raises ValueError for a malformed port
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname)
+
+
+def _check_field(where: str, field: str, kind: str, value) -> None:
+    """Raise ConfigError when value is not of kind. Messages never include the value: a key
+    pasted into the wrong field must not be copied into the log."""
+    valid = {
+        "str": lambda v: isinstance(v, str),
+        "name": lambda v: isinstance(v, str) and _NAME.fullmatch(v) is not None,
+        "bool": lambda v: isinstance(v, bool),
+        "seconds": lambda v: (isinstance(v, (int, float)) and not isinstance(v, bool)
+                              and math.isfinite(v) and v > 0),
+        "url": lambda v: isinstance(v, str) and _http_url(v),
+        # The idle sampler reads plain http only.
+        "urls": lambda v: isinstance(v, list) and all(
+            isinstance(u, str) and _http_url(u) and u.startswith("http://") for u in v
+        ),
+    }[kind](value)
+    if not valid:
+        expected = {
+            "str": "a string", "bool": "true or false", "seconds": "a positive number",
+            "name": "a variable name (letters, digits, underscore), not the key itself",
+            "url": "an http(s) URL with a host", "urls": "a list of http:// URLs",
+        }[kind]
+        raise ConfigError(f"{where}: {field} must be {expected}")
+
+
+def _provider(name: str, table) -> Provider:
+    where = f"providers.{name}"
+    if not isinstance(table, dict):
+        raise ConfigError(f"{where} must be a table")
+    kind = table.get("type")
+    if kind not in _TYPE_DEFAULTS:
+        raise ConfigError(f"{where}: type must be one of {', '.join(_TYPE_DEFAULTS)}")
+    if "api_key" in table:
+        # The value is never echoed: this message may land in a log.
+        raise ConfigError(
+            f"{where}: inline api_key is not allowed; use api_key_env or api_key_file"
+        )
+    kinds = {**_COMMON_FIELDS, **_TYPE_FIELDS[kind]}
+    unknown = set(table) - set(kinds)
+    if unknown:
+        raise ConfigError(f"{where}: unknown field(s) for type {kind}: {', '.join(sorted(unknown))}")
+    for field, value in table.items():
+        _check_field(where, field, kinds[field], value)
+    fields = {key: value for key, value in table.items() if key != "budget_s"}
+    fields["url"] = table.get("url") or _TYPE_DEFAULTS[kind]["url"]
+    if not fields["url"]:
+        raise ConfigError(f"{where}: type openai needs a url")
+    if not table.get("model"):
+        raise ConfigError(f"{where}: model is required")
+    if bool(table.get("api_key_file")) != bool(table.get("api_key_var")):
+        raise ConfigError(f"{where}: api_key_file and api_key_var go together (the file, and the "
+                          "key's name in it)")
+    if kind != "openai" and not (table.get("api_key_env") or table.get("api_key_file")):
+        raise ConfigError(f"{where}: type {kind} needs api_key_env or api_key_file")
+    if "api_key_file" in fields:
+        fields["api_key_file"] = os.path.expanduser(fields["api_key_file"])
+    if "idle_metrics" in fields:
+        fields["idle_metrics"] = tuple(str(url) for url in fields["idle_metrics"])
+    if "idle_seconds" in fields:
+        fields["idle_seconds"] = float(fields["idle_seconds"])
+    budget = float(table.get("budget_s", _TYPE_DEFAULTS[kind]["budget_s"]))
+    return Provider(name=name, budget=budget, **fields)
+
+
+def parse_config(data: dict) -> Config:
+    unknown = set(data) - {"chain", "providers"}
+    if unknown:
+        raise ConfigError(f"unknown top-level key(s): {', '.join(sorted(unknown))}")
+    tables = data.get("providers") or {}
+    if not isinstance(tables, dict) or not tables:
+        raise ConfigError("config defines no [providers.<name>] tables")
+    providers = {name: _provider(name, table) for name, table in tables.items()}
+    chain = data.get("chain", list(providers))
+    if not isinstance(chain, list) or not chain or not all(isinstance(n, str) for n in chain):
+        raise ConfigError("chain must be a non-empty list of provider names")
+    return Config(providers, _checked_chain(chain, providers, "chain"))
+
+
+def _checked_chain(names, providers: dict, source: str) -> tuple[str, ...]:
+    unknown = [name for name in names if name not in providers]
+    if unknown:
+        raise ConfigError(f"{source} names undefined provider(s): {', '.join(unknown)}")
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise ConfigError(f"{source} repeats provider(s): {', '.join(repeated)}")
+    return tuple(names)
+
+
+def load_config(path: str) -> Config:
+    try:
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except OSError as error:
+        raise ConfigError(f"cannot read config {path}: {error.strerror}") from None
+    except tomllib.TOMLDecodeError as error:
+        raise ConfigError(f"invalid TOML in {path}: {error}") from None
+    return parse_config(data)
+
+
+def chain_override(config: Config, text: str) -> tuple[str, ...]:
+    """Apply OBSERVER_ROUTER_CHAIN: a comma-separated list of provider names, or empty."""
+    names = [name.strip() for name in text.split(",") if name.strip()]
+    if not names:
+        return config.chain
+    return _checked_chain(names, config.providers, "OBSERVER_ROUTER_CHAIN")
+
+
+# Environment variables that configured providers before the config file existed. Setting one
+# now does nothing, so start-up names them rather than ignoring them silently.
+_REMOVED_ENV_PREFIXES = ("OBSERVER_LOCAL_", "OBSERVER_CURSOR_", "OBSERVER_GEMINI_",
+                         "OBSERVER_OPENROUTER_")
+
+
+def stale_environment(env) -> list[str]:
+    return sorted(
+        name for name in env
+        if name.startswith(_REMOVED_ENV_PREFIXES) or name == "CLAUDE_MEM_SETTINGS"
+    )
+
+
+# The active configuration. main() fills these; they stay empty until then so importing the
+# module (the tests do) never reads a config file.
+PROVIDERS: dict[str, Provider] = {}
+CHAIN: tuple[str, ...] = ()
+
+
+def configure(config: Config, chain: tuple[str, ...] | None = None) -> None:
+    global PROVIDERS, CHAIN
+    PROVIDERS = dict(config.providers)
+    CHAIN = tuple(chain or config.chain)
 
 
 # --- prompt safety ------------------------------------------------------------
@@ -564,10 +706,11 @@ def compaction_snapshot() -> dict:
 # --- circuit breaker ----------------------------------------------------------
 
 _breaker_lock = threading.Lock()
-_failures = dict.fromkeys(CHAIN, 0)
-_skip_until = dict.fromkeys(CHAIN, 0.0)
-# Why a tier is skipped: "breaker-open", or the quota the provider says is exhausted.
-_skip_reason = dict.fromkeys(CHAIN, "")
+# Keyed by provider name, so two instances of one type break and block independently.
+_failures: dict[str, int] = {}
+_skip_until: dict[str, float] = {}
+# Why a provider is skipped: "breaker-open", or the quota the provider says is exhausted.
+_skip_reason: dict[str, str] = {}
 
 
 def tier_skip_reason(name: str) -> str | None:
@@ -702,15 +845,15 @@ def _openrouter_quota(headers, body: str) -> tuple[float, str] | None:
         return None
 
 
-def quota_reset(tier: str, error: HTTPError, now: float | None = None) -> tuple[float, str] | None:
-    """Return (reset_epoch, quota_name) when a 429 states when the quota comes back."""
+def quota_reset(kind: str, error: HTTPError, now: float | None = None) -> tuple[float, str] | None:
+    """Return (reset_epoch, quota_name) when a 429 from a provider of this type states its reset."""
     if error.code != 429:
         return None
     now = time.time() if now is None else now
     body = _error_body(error)
-    if tier == "gemini":
+    if kind == "gemini":
         found = _gemini_quota(body, now)
-    elif tier == "openrouter":
+    elif kind == "openrouter":
         found = _openrouter_quota(error.headers, body)
     else:
         found = None
@@ -733,91 +876,96 @@ class TierFailure(Exception):
         self.quota = quota
 
 
-_TIER_URLS = {
-    "gemini": GEMINI_URL,
-    "openrouter": OPENROUTER_URL,
-    "cursor": CURSOR_URL,
-    "local": LOCAL_URL,
-}
-_TIER_MODELS = {
-    "gemini": GEMINI_MODEL,
-    "openrouter": OPENROUTER_MODEL,
-    "cursor": CURSOR_MODEL,
-    "local": LOCAL_MODEL,
-}
-
-
-def _payload_for(tier: str, body: dict, reasoning_mode: str | None) -> dict:
-    if tier not in _TIER_MODELS:
-        raise TierFailure(f"unknown tier {tier}")
+def payload_for(provider: Provider, body: dict, reasoning_mode: str | None) -> dict:
     payload = {
-        "model": _TIER_MODELS[tier],
+        "model": provider.model,
         "messages": body.get("messages") or [],
         "stream": bool(body.get("stream")),
     }
     for key in ("temperature", "max_tokens", "top_p", "stop"):
         if body.get(key) is not None:
             payload[key] = body[key]
-    if tier == "local" and LOCAL_REASONING_EFFORT:
-        # Splash honours reasoning_effort and ignores chat_template_kwargs entirely.
-        # Without this a reasoning model spends the whole max_tokens budget thinking
-        # and returns content=None with finish_reason=length, which the router then
-        # reports as "empty content" and the chain loses its backstop.
-        payload["reasoning_effort"] = LOCAL_REASONING_EFFORT
-    if tier == "openrouter" and reasoning_mode == "disabled":
+    if provider.reasoning_effort:
+        # Splash honours reasoning_effort ("none" switches thinking off) and ignores
+        # chat_template_kwargs entirely. Without it a reasoning model spends the whole
+        # max_tokens budget thinking and returns content=None with finish_reason=length, which
+        # the router then reports as "empty content". Unset for lanes that reject unknown
+        # fields (mlx_lm does).
+        payload["reasoning_effort"] = provider.reasoning_effort
+    if provider.type == "openrouter" and reasoning_mode == "disabled":
         # Without this, reasoning models burn the whole budget on reasoning and
         # return empty content.
         payload["reasoning"] = {"enabled": False}
-    elif tier == "openrouter" and reasoning_mode == "exclude":
+    elif provider.type == "openrouter" and reasoning_mode == "exclude":
         # Some endpoints reject enabled=false with HTTP 400; keep reasoning on but
         # hide it from the response.
         payload["reasoning"] = {"exclude": True}
     return payload
 
 
-def cursor_api_key() -> str:
-    """Return OBSERVER_CURSOR_API_KEY, else CURSOR_BRIDGE_API_KEY from OBSERVER_CURSOR_ENV_FILE."""
-    if CURSOR_API_KEY:
-        return CURSOR_API_KEY
-    if not CURSOR_ENV_FILE:
-        return ""
-    try:
-        with open(CURSOR_ENV_FILE) as handle:
-            for line in handle:
-                name, sep, value = line.strip().partition("=")
-                if sep and name.strip() == "CURSOR_BRIDGE_API_KEY":
-                    return value.strip().strip("\"'")
-    except OSError as error:
-        log(f"cursor: cannot read OBSERVER_CURSOR_ENV_FILE: {type(error).__name__}")
+_QUOTED_VALUE = re.compile(r"""(["'])(.*)\1\s*(?:#.*)?""")
+
+
+def _key_from_file(path: str, var: str) -> str:
+    """Read one key from a dotenv-style file, or from a JSON object when the path ends .json.
+
+    Reading the key where it already lives (a bridge's env file, claude-mem's settings) keeps
+    one copy of the secret, so rotating it there cannot silently break the provider. The file
+    is re-read on every call, so a rotation takes effect without a restart.
+    """
+    with open(path) as handle:
+        if path.endswith(".json"):
+            value = json.load(handle).get(var)  # top-level keys only
+            return str(value).strip() if value else ""
+        found = ""
+        for line in handle:  # the last assignment wins, as when the file is sourced
+            name, sep, value = line.strip().removeprefix("export ").partition("=")
+            if not sep or name.strip() != var:
+                continue
+            quoted = _QUOTED_VALUE.fullmatch(value.strip())
+            found = quoted.group(2) if quoted else value.split(" #", 1)[0].strip()
+    return found
+
+
+def api_key(provider: Provider) -> str:
+    """Return the provider's key: api_key_env first, then api_key_var in api_key_file."""
+    if provider.api_key_env:
+        key = os.environ.get(provider.api_key_env, "").strip()
+        if key:
+            return key
+    if provider.api_key_file:
+        path = provider.api_key_file
+        try:
+            return _key_from_file(path, provider.api_key_var)
+        except OSError as error:
+            raise TierFailure(f"{provider.name}: cannot read {path}: {error.strerror}") from None
+        except (ValueError, AttributeError) as error:
+            # The decoder's message is not echoed: it can quote the file's contents.
+            raise TierFailure(
+                f"{provider.name}: cannot parse {path}: {type(error).__name__}"
+            ) from None
     return ""
 
 
-def _headers_for(tier: str) -> dict:
-    config = settings()
+def headers_for(provider: Provider) -> dict:
     headers = {"Content-Type": "application/json"}
-    if tier == "gemini":
-        key = (config.get("CLAUDE_MEM_GEMINI_API_KEY") or "").strip()
+    wants_key = provider.api_key_env or provider.api_key_file
+    if wants_key:
+        key = api_key(provider)
         if not key:
-            raise TierFailure("gemini: no CLAUDE_MEM_GEMINI_API_KEY configured")
+            sources = " or ".join(filter(None, (
+                provider.api_key_env and f"${provider.api_key_env}",
+                provider.api_key_file and f"{provider.api_key_var} in {provider.api_key_file}",
+            )))
+            raise TierFailure(f"{provider.name}: no API key in {sources}")
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in key):
+            # http.client would reject the header and quote the whole key in its error.
+            raise TierFailure(f"{provider.name}: API key contains control characters")
         headers["Authorization"] = f"Bearer {key}"
-    elif tier == "openrouter":
-        key = (config.get("CLAUDE_MEM_OPENROUTER_API_KEY") or "").strip()
-        if not key:
-            raise TierFailure("openrouter: no CLAUDE_MEM_OPENROUTER_API_KEY configured")
-        headers["Authorization"] = f"Bearer {key}"
-        site = (config.get("CLAUDE_MEM_OPENROUTER_SITE_URL") or "").strip()
-        app = (config.get("CLAUDE_MEM_OPENROUTER_APP_NAME") or "claude-mem").strip()
-        if site:
-            headers["HTTP-Referer"] = site
-        headers["X-Title"] = app
-    elif tier == "cursor":
-        key = cursor_api_key()
-        if not key:
-            raise TierFailure(
-                "cursor: no OBSERVER_CURSOR_API_KEY or CURSOR_BRIDGE_API_KEY in "
-                "OBSERVER_CURSOR_ENV_FILE"
-            )
-        headers["Authorization"] = f"Bearer {key}"
+    if provider.type == "openrouter":
+        if provider.site_url:
+            headers["HTTP-Referer"] = provider.site_url
+        headers["X-Title"] = provider.app_name
     return headers
 
 
@@ -847,33 +995,31 @@ class UpstreamResponse:
             self._connection.close()
 
 
-def _connect(tier: str, timeout: float):
-    """Open an http(s) connection for a tier, rejecting any other scheme."""
-    parts = urllib.parse.urlsplit(_TIER_URLS[tier])
+def _connect(provider: Provider, timeout: float):
+    """Open an http(s) connection for a provider, rejecting any other scheme."""
+    parts = urllib.parse.urlsplit(provider.url)
     host = parts.hostname
     if not host:
-        raise TierFailure(f"{tier}: URL has no host")
+        raise TierFailure(f"{provider.name}: URL has no host")
     if parts.scheme == "https":
         return http.client.HTTPSConnection(host, parts.port or 443, timeout=timeout)
     if parts.scheme == "http":
         return http.client.HTTPConnection(host, parts.port or 80, timeout=timeout)
-    raise TierFailure(f"{tier}: refusing non-http(s) URL")
+    raise TierFailure(f"{provider.name}: refusing non-http(s) URL")
 
 
-def _open(tier: str, body: dict, timeout: float, reasoning_mode: str | None):
-    if tier not in _TIER_URLS:
-        raise TierFailure(f"unknown tier {tier}")
-    parts = urllib.parse.urlsplit(_TIER_URLS[tier])
-    payload = json.dumps(_payload_for(tier, body, reasoning_mode)).encode()
-    headers = _headers_for(tier)
+def _open(provider: Provider, body: dict, timeout: float, reasoning_mode: str | None):
+    parts = urllib.parse.urlsplit(provider.url)
+    payload = json.dumps(payload_for(provider, body, reasoning_mode)).encode()
+    headers = headers_for(provider)
     headers["Content-Length"] = str(len(payload))
-    connection = _connect(tier, timeout)
+    connection = _connect(provider, timeout)
     try:
         connection.request("POST", parts.path or "/", body=payload, headers=headers)
         response = connection.getresponse()
     except Exception as error:
         connection.close()
-        raise TierFailure(f"{tier}: {type(error).__name__}: {error}") from error
+        raise TierFailure(f"{provider.name}: {type(error).__name__}: {error}") from error
     if response.status >= 400:
         try:
             # Bounded but whole: a Gemini 429 names its quota only past the first ~1.5 KB.
@@ -882,7 +1028,7 @@ def _open(tier: str, body: dict, timeout: float, reasoning_mode: str | None):
             detail = ""
         connection.close()
         error = HTTPError(
-            _TIER_URLS[tier], response.status, detail[:300], response.headers,
+            provider.url, response.status, detail[:300], response.headers,
             BytesIO(detail.encode()),
         )
         error.body_text = detail
@@ -906,12 +1052,15 @@ def _snippet(error: HTTPError) -> str:
     return _error_body(error)[:160]
 
 
-def _http_failure(tier: str, error: HTTPError) -> TierFailure:
-    quota = quota_reset(tier, error)
+def _http_failure(provider: Provider, error: HTTPError) -> TierFailure:
+    quota = quota_reset(provider.type, error)
+    name = provider.name
     if quota:
-        retry_at, name = quota
-        return TierFailure(f"{tier}: HTTP {error.code}: quota {name} exhausted", retry_at, name)
-    return TierFailure(f"{tier}: HTTP {error.code}: {_snippet(error)}")
+        retry_at, quota_name = quota
+        return TierFailure(
+            f"{name}: HTTP {error.code}: quota {quota_name} exhausted", retry_at, quota_name
+        )
+    return TierFailure(f"{name}: HTTP {error.code}: {_snippet(error)}")
 
 
 def _is_mandatory_reasoning_error(error: HTTPError) -> bool:
@@ -921,49 +1070,53 @@ def _is_mandatory_reasoning_error(error: HTTPError) -> bool:
     return "reasoning" in detail and "mandatory" in detail
 
 
-def _should_retry_with_reasoning_excluded(tier: str, error: HTTPError) -> bool:
-    """True when an OpenRouter endpoint refuses to run without reasoning enabled."""
-    return tier == "openrouter" and _is_mandatory_reasoning_error(error)
-
-
-def _open_with_reasoning_retry(tier: str, body: dict, timeout: float, reasoning_mode: str | None):
-    """Open a tier, retrying once with reasoning.exclude when an endpoint demands it."""
+def _open_with_reasoning_retry(
+    provider: Provider, body: dict, timeout: float, reasoning_mode: str | None
+):
+    """Open a provider, retrying an OpenRouter endpoint once with reasoning.exclude when it
+    refuses to run with reasoning disabled."""
+    name = provider.name
     try:
-        return _open(tier, body, timeout, reasoning_mode)
+        return _open(provider, body, timeout, reasoning_mode)
     except HTTPError as error:
-        if _should_retry_with_reasoning_excluded(tier, error):
-            log("openrouter: endpoint requires reasoning; retrying with reasoning.exclude")
+        if provider.type == "openrouter" and _is_mandatory_reasoning_error(error):
+            log(f"{name}: endpoint requires reasoning; retrying with reasoning.exclude")
             try:
-                return _open(tier, body, timeout, "exclude")
+                return _open(provider, body, timeout, "exclude")
             except HTTPError as retry_error:
-                raise _http_failure(tier, retry_error) from retry_error
+                raise _http_failure(provider, retry_error) from retry_error
             except Exception as retry_error:
                 raise TierFailure(
-                    f"{tier}: {type(retry_error).__name__}: {retry_error}"
+                    f"{name}: {type(retry_error).__name__}: {retry_error}"
                 ) from retry_error
-        raise _http_failure(tier, error) from error
+        raise _http_failure(provider, error) from error
+    except TierFailure:
+        raise
     except Exception as error:
-        raise TierFailure(f"{tier}: {type(error).__name__}: {error}") from error
+        raise TierFailure(f"{name}: {type(error).__name__}: {error}") from error
 
 
 def _budget_left(budget: float, deadline: float) -> float:
     return max(1.0, min(budget, deadline - time.time()))
 
 
-def iter_stream(tier: str, body: dict, budget: float, deadline: float):
+def _reasoning_mode(provider: Provider) -> str | None:
+    return "disabled" if provider.type == "openrouter" else None
+
+
+def iter_stream(provider: Provider, body: dict, deadline: float):
     """Yield ('meta', served_model) once, then ('delta', text) frames.
 
-    Raises TierFailure when the tier produces no content or errors before the first
-    content delta, so the caller can still fall through to the next tier.
+    Raises TierFailure when the provider produces no content or errors before the first
+    content delta, so the caller can still fall through to the next provider.
     """
-    reasoning_mode = "disabled" if tier == "openrouter" else None
-    with local_lane_guard(tier):
-        yield from _iter_stream_locked(tier, body, budget, deadline, reasoning_mode)
+    with lane_guard(provider):
+        yield from _iter_stream_locked(provider, body, deadline, _reasoning_mode(provider))
 
 
-def _iter_stream_locked(tier, body, budget, deadline, reasoning_mode):
+def _iter_stream_locked(provider, body, deadline, reasoning_mode):
     response = _open_with_reasoning_retry(
-        tier, body, _budget_left(budget, deadline), reasoning_mode
+        provider, body, _budget_left(provider.budget, deadline), reasoning_mode
     )
 
     served = None
@@ -987,32 +1140,31 @@ def _iter_stream_locked(tier, body, budget, deadline, reasoning_mode):
                 continue  # reasoning deltas are intentionally dropped
             if not saw_content:
                 saw_content = True
-                yield ("meta", served or f"{tier}:{reasoning_mode or 'default'}")
+                yield ("meta", served or provider.model)
             yield ("delta", piece)
     finally:
         response.close()
     if not saw_content:
-        raise TierFailure(f"{tier}: stream produced no content")
+        raise TierFailure(f"{provider.name}: stream produced no content")
 
 
-def nonstream(tier: str, body: dict, budget: float, deadline: float):
-    """Return (response_dict, content) for a tier, or raise TierFailure."""
-    reasoning_mode = "disabled" if tier == "openrouter" else None
-    with local_lane_guard(tier):
+def nonstream(provider: Provider, body: dict, deadline: float):
+    """Return (response_dict, content) for a provider, or raise TierFailure."""
+    with lane_guard(provider):
         response = _open_with_reasoning_retry(
-            tier, body, _budget_left(budget, deadline), reasoning_mode
+            provider, body, _budget_left(provider.budget, deadline), _reasoning_mode(provider)
         )
         try:
             payload = json.load(response)
         except Exception as error:
-            raise TierFailure(f"{tier}: unreadable response: {error}") from error
+            raise TierFailure(f"{provider.name}: unreadable response: {error}") from error
         finally:
             response.close()
     choice = (payload.get("choices") or [{}])[0]
     content = ((choice.get("message") or {}).get("content") or "").strip()
     if not content:
         raise TierFailure(
-            f"{tier}: empty content (finish_reason={choice.get('finish_reason')})"
+            f"{provider.name}: empty content (finish_reason={choice.get('finish_reason')})"
         )
     return payload, content
 
@@ -1068,8 +1220,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._json(200, {
                 "status": "ok",
                 "chain": list(CHAIN),
-                "models": dict(_TIER_MODELS),
-                "budgets_s": BUDGETS,
+                "providers": {
+                    name: {"type": PROVIDERS[name].type, "model": PROVIDERS[name].model,
+                           "budget_s": PROVIDERS[name].budget}
+                    for name in CHAIN
+                },
                 "breaker": breaker_snapshot(),
                 "prompt_guard": compaction_snapshot(),
                 "power": power_snapshot(),
@@ -1114,7 +1269,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             )
 
         allowed, _ = allowed_tiers()
-        deadline = time.time() + sum(BUDGETS.get(t, 0.0) for t in allowed) + 5.0
+        deadline = time.time() + sum(PROVIDERS[name].budget for name in allowed) + 5.0
         if body.get("stream"):
             self._stream(body, deadline)
         else:
@@ -1128,17 +1283,16 @@ class RouterHandler(BaseHTTPRequestHandler):
         for tier, reason in skipped.items():
             attempted.append(f"{tier}({reason})")
         for tier in allowed:
-            # The idle gate is re-read here: earlier tiers can take tens of seconds, and a
-            # lane that became busy meanwhile must still keep the local tier out.
-            skip_reason = tier_skip_reason(tier) or (
-                local_busy_reason() if tier == "local" else None
-            )
+            # The idle gate is re-read here: earlier providers can take tens of seconds, and a
+            # lane that became busy meanwhile must still keep a local provider out.
+            provider = PROVIDERS[tier]
+            skip_reason = tier_skip_reason(tier) or busy_reason(provider)
             if skip_reason:
                 attempted.append(f"{tier}({skip_reason})")
                 continue
             started = time.time()
             try:
-                generator = iter_stream(tier, body, BUDGETS.get(tier, 30.0), deadline)
+                generator = iter_stream(provider, body, deadline)
                 _, served = next(generator)  # blocks until the first content delta
             except StopIteration:
                 tier_failed(tier, "no frames")
@@ -1187,17 +1341,16 @@ class RouterHandler(BaseHTTPRequestHandler):
         for tier, reason in skipped.items():
             attempted.append(f"{tier}({reason})")
         for tier in allowed:
-            # The idle gate is re-read here: earlier tiers can take tens of seconds, and a
-            # lane that became busy meanwhile must still keep the local tier out.
-            skip_reason = tier_skip_reason(tier) or (
-                local_busy_reason() if tier == "local" else None
-            )
+            # The idle gate is re-read here: earlier providers can take tens of seconds, and a
+            # lane that became busy meanwhile must still keep a local provider out.
+            provider = PROVIDERS[tier]
+            skip_reason = tier_skip_reason(tier) or busy_reason(provider)
             if skip_reason:
                 attempted.append(f"{tier}({skip_reason})")
                 continue
             started = time.time()
             try:
-                payload, content = nonstream(tier, body, BUDGETS.get(tier, 30.0), deadline)
+                payload, content = nonstream(provider, body, deadline)
             except TierFailure as failure:
                 record_failure(tier, failure)
                 attempted.append(f"{tier}({failure})")
@@ -1227,13 +1380,22 @@ class RouterHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    try:
+        config = load_config(CONFIG_PATH)
+        configure(config, chain_override(config, os.environ.get("OBSERVER_ROUTER_CHAIN", "")))
+    except ConfigError as error:
+        log(f"config error: {error}")
+        raise SystemExit(2) from None
+    stale = stale_environment(os.environ)
+    if stale:
+        log(f"ignoring removed environment variable(s), now config fields: {', '.join(stale)}")
+    lanes = watched_lanes()
     log(
-        f"starting on {HOST}:{PORT} chain={','.join(CHAIN)} "
+        f"starting on {HOST}:{PORT} config={CONFIG_PATH} chain={','.join(CHAIN)} "
         f"max_prompt_chars={MAX_PROMPT_CHARS} max_field_chars={MAX_FIELD_CHARS} "
-        f"local_ac_only={LOCAL_AC_ONLY} power={power_source()} "
-        f"idle_gate={','.join(LOCAL_IDLE_METRICS) or 'off'}"
+        f"power={power_source()} idle_gate={','.join(lanes) or 'off'}"
     )
-    if LOCAL_IDLE_METRICS:
+    if lanes:
         threading.Thread(target=_sample_lanes_forever, name="idle-sampler", daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), RouterHandler)
     server.daemon_threads = True

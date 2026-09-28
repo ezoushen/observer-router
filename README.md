@@ -1,7 +1,9 @@
-# Observer router — claude-mem provider chain
+# Observer router — an OpenAI-compatible provider chain
 
 OpenAI-compatible router that fronts claude-mem's observer calls, so an observer request
-survives a dead local lane. One process, standard library only, on `127.0.0.1:1244`.
+survives a dead local lane. One process, standard library only, on `127.0.0.1:1244`. The chain
+is a config file of named provider instances, so it works for any OpenAI-compatible client and
+needs nothing from claude-mem.
 
 ## Why this exists
 
@@ -21,19 +23,22 @@ boundary. See [the upstream research](docs/researches/2026-09-15-claude-mem-prov
 
 ## Chain
 
-| Order | Upstream | Model | Budget to first content | Notes |
-| ---: | --- | --- | ---: | --- |
-| 1 | `generativelanguage.googleapis.com/v1beta/openai` | `gemini-flash-lite-latest` | 18 s | Primary hop; fast when healthy |
-| 2 | `openrouter.ai/api/v1` | `openrouter/free` (Free Models Router) | 24 s | Auto-selects among ~28 free variants; `prompt=0 completion=0`, 200k ctx |
-| 3 (opt-in) | `127.0.0.1:8765/v1` ([cursor-api-proxy] bridge) | `composer-2.5` | 40 s | Cursor subscription models; remote compute, runs on battery |
-| 4 | `127.0.0.1:1243/v1` | your local model id (`OBSERVER_LOCAL_MODEL`) | 70 s | Guaranteed-content backstop; a cache-capped local lane |
+The chain is an ordered list of **provider instances** defined in a TOML file (see
+[Configuration](#configuration)). Each instance has one of three types, and several instances
+may share a type — two Gemini keys, say, each with its own breaker and quota block:
 
-The default chain is `gemini,openrouter,local`; the cursor tier joins only when
-`OBSERVER_ROUTER_CHAIN` names it, because the bridge is a separate install. Without it the
-budgets sum to 112 s, under claude-mem's `CLAUDE_MEM_API_TIMEOUT_MS` (120 s). With it they sum
-to 152 s, so a chain in which every tier hangs to its budget outlives that timeout; raise the
-timeout to at least 160 s when enabling the cursor tier. While on battery the local tier is
-skipped and the remaining budgets sum to 82 s.
+| Type | Upstream | Default budget to first content | Notes |
+| --- | --- | ---: | --- |
+| `gemini` | `generativelanguage.googleapis.com/v1beta/openai` | 18 s | Daily-quota 429s block the instance until midnight Pacific |
+| `openrouter` | `openrouter.ai/api/v1` | 24 s | Reasoning disabled per request; `X-RateLimit-Reset` blocks the instance |
+| `openai` | any OpenAI-compatible `url` | 40 s | Local lanes and bridges; key optional; the GPU-lane gates live here |
+
+The reference deployment runs `gemini` (`gemini-flash-lite-latest`) → `openrouter`
+(`openrouter/free`) → `cursor` (`composer-2.5` through a [cursor-api-proxy] bridge on `:8765`, 40
+s) → `local` (an MLX/Splash lane, 70 s). Keep the budgets' sum under the client's timeout:
+claude-mem's `CLAUDE_MEM_API_TIMEOUT_MS` defaults to 120 s, and that four-instance chain sums to
+152 s, so a chain in which every instance hangs to its budget outlives it. Raise the timeout to at
+least 160 s for that chain.
 
 [cursor-api-proxy]: https://github.com/anyrobert/cursor-api-proxy
 
@@ -49,9 +54,9 @@ skipped and the remaining budgets sum to 82 s.
 - **A tier with no content is a failure, not a result.** Streaming or not, an empty answer
   falls through to the next tier, so claude-mem never records an empty observation.
 - **Reasoning deltas are dropped.** Only `delta.content` is forwarded downstream.
-- **The cursor tier authenticates to the bridge, not to Cursor.** The key is
-  `OBSERVER_CURSOR_API_KEY`, or else the `CURSOR_BRIDGE_API_KEY` line of the bridge's own env
-  file named by `OBSERVER_CURSOR_ENV_FILE`, so the secret has one copy. No key fails the tier.
+- **A bridge instance authenticates to the bridge, not to the service behind it.** Point its
+  `api_key_file` at the bridge's own env file (for cursor-api-proxy, `CURSOR_BRIDGE_API_KEY`), so
+  the secret has one copy. A configured key source that yields no key fails the instance.
 - **An observer skip looks like a failure.** claude-mem's prompt asks for an empty response
   when a tool call is routine. A tier that obeys returns empty content, so the next tier runs
   and may record what the first one skipped.
@@ -66,7 +71,7 @@ mid-stream failure cannot switch tiers — it is logged and the stream is closed
 
 ## Prompt safety and context folding
 
-Every request is sanitized once before tier selection, so all three tiers receive the same
+Every request is sanitized once before provider selection, so every provider receives the same
 bounded conversation:
 
 - OpenAI image parts and `data:image/...;base64,...` payloads become descriptive markers.
@@ -87,11 +92,12 @@ See [the diagnosis](docs/researches/2026-09-19-observer-lane-oom-diagnosis.md).
 
 ## Circuit breaker
 
-Three consecutive failures on a tier skip it for 60 s (`OBSERVER_BREAK_AFTER`,
+Breakers and quota blocks are kept per instance. Three consecutive failures on an instance skip
+it for 60 s (`OBSERVER_BREAK_AFTER`,
 `OBSERVER_BREAK_SECONDS`). Every failed attempt is logged with its reason, so a failing tier
 is visible in the log without reproduction.
 
-A 429 that states when its quota resets skips the tier until then instead:
+A 429 that states when its quota resets skips the instance until then instead:
 
 - **Gemini** names the exhausted quotas in `google.rpc.QuotaFailure`. Any `PerDay` quota
   blocks the tier until the next midnight Pacific, when Gemini's daily quotas reset.
@@ -104,97 +110,132 @@ A 429 that states when its quota resets skips the tier until then instead:
 - A shorter breaker skip never cuts a quota block short, and the next success clears it.
 
 The block is logged once with its reset time, named in the failed-chain `attempted` array, and
-reported in `/health` as `breaker.<tier>.reason`.
+reported in `/health` as `breaker.<name>.reason`.
 
-## Power rule — the local tier runs only on AC
+## Power rule — GPU lanes run only on AC
 
-The local tier is a GPU workload. With the MacBook unplugged, starting the lane is a poor
-trade, so the router skips it and names the reason in its failed-chain body:
+A local lane is a GPU workload. With the MacBook unplugged, starting it is a poor trade, so an
+`openai` instance with `ac_only = true` is skipped and the failed-chain body names the reason:
 
 ```text
 {"error": "all tiers failed", "attempted": ["local(skipped: on battery (AC-only))"]}
 ```
 
-- `OBSERVER_LOCAL_AC_ONLY=1` (default) skips the local tier whenever `pmset -g batt` reports
-  `Battery Power`. Desktops always report AC, so the gate is inert there.
+- The instance is skipped whenever `pmset -g batt` reports `Battery Power`. Desktops always
+  report AC, so the gate is inert there. Instances without `ac_only` run on battery.
 - The probe is cached for `OBSERVER_POWER_CACHE_SECONDS` (30 s) and never runs per request.
-- If `pmset` is missing, hung, or unreadable, the source reads `unknown` and the local tier
+- If `pmset` is missing, hung, or unreadable, the source reads `unknown` and the instance
   **stays available** — a failed probe must not take the observer offline.
-- `/health` exposes `power.source`, `power.local_ac_only`, and `power.local_tier_allowed`.
+- `/health` exposes `power.source`, `power.ac_only` (the gated instances), and
+  `power.ac_only_allowed`.
 
-Skipping a tier is only safe because claude-mem retries instead of dropping work. On a failed
+Skipping an instance is only safe because claude-mem retries instead of dropping work. On a failed
 chain it logs `Observer failed {kind=quota_exhausted}`, enters a provider quota cooldown, and
 resumes when the cooldown clears; the requeue path is `resetProcessingToPending()`. One
 caveat: in plugin `13.24.8` the queue is in-memory, so that cushion holds only while the
 worker process stays up. See
 [the retry research](docs/researches/2026-09-20-claude-mem-retry-and-quota-limits.md).
 
-## Idle rule — the local tier waits for interactive lanes
+## Idle rule — a GPU lane waits for interactive lanes
 
-The local lane shares the GPU with any interactive lanes on the same machine. Set
-`OBSERVER_LOCAL_IDLE_METRICS` to those lanes' Prometheus `/metrics` URLs, comma-separated, and
-the local tier runs only once every one of them has been idle for
-`OBSERVER_LOCAL_IDLE_SECONDS` (30 s). Unset, the gate is off.
+A local lane shares the GPU with any interactive lanes on the same machine. Give its instance
+`idle_metrics`, a list of those lanes' Prometheus `/metrics` URLs, and it runs only once every
+one of them has been idle for `idle_seconds` (30 s). Without `idle_metrics` the gate is off.
 
 - A lane is active while `submitted − completed − cancelled − failed` is above zero, or when
   its submitted counter moved since the previous sample. The second rule catches a request that
   started and finished between samples.
-- A background thread samples every `OBSERVER_IDLE_SAMPLE_SECONDS` (2 s). The grace period
-  covers the pause an agent loop takes between requests while its tools run.
-- The gate is read when the request arrives and again just before the local tier runs, because
-  the tiers ahead of it can take tens of seconds.
+- A background thread samples every `OBSERVER_IDLE_SAMPLE_SECONDS` (2 s), covering the lanes of
+  every instance in the active chain. The grace period covers the pause an agent loop takes
+  between requests while its tools run.
+- The gate is read when the request arrives and again just before the instance runs, because
+  the instances ahead of it can take tens of seconds.
 - An unreachable or unreadable lane is not activity: it ages into idle, so a stopped lane cannot
   keep the observer offline.
-- A skipped tier is named in the failed-chain body, for example
+- A skipped instance is named in the failed-chain body, for example
   `local(skipped: lanes busy (127.0.0.1:1240, idle 30s required))`, and claude-mem retries
   after its cooldown, as with the power rule.
-- A local call already running is not interrupted when a lane becomes active.
-- `/health` reports `idle_gate.seconds_since_active` per lane and `idle_gate.local_tier_allowed`.
+- A call already running is not interrupted when a lane becomes active.
+- `/health` reports `idle_gate.<name>.seconds_since_active` per lane and
+  `idle_gate.<name>.allowed`.
 
 ## Configuration
 
-Read from claude-mem's settings at startup and re-read whenever the file changes, so keys
-edited in the claude-mem console take effect without restarting the router:
+The router reads one TOML file: `OBSERVER_ROUTER_CONFIG`, default
+`~/.config/observer-router/config.toml`. Start from [`config.example.toml`](config.example.toml),
+which documents every field. A missing or invalid file stops the router at start-up with the
+reason in the log (exit status 2); it never starts with a partial chain.
 
-- `CLAUDE_MEM_GEMINI_API_KEY` — required for tier 1
-- `CLAUDE_MEM_OPENROUTER_API_KEY` — required for tier 2 (the free router still authenticates)
-- `CLAUDE_MEM_OPENROUTER_SITE_URL` / `CLAUDE_MEM_OPENROUTER_APP_NAME` — optional OpenRouter
-  attribution headers
+```toml
+chain = ["gemini-a", "gemini-b", "local"]
 
-Overrides (all optional):
+[providers.gemini-a]
+type = "gemini"
+model = "gemini-flash-lite-latest"
+api_key_env = "GEMINI_API_KEY_A"
+
+[providers.gemini-b]
+type = "gemini"
+model = "gemini-flash-lite-latest"
+api_key_file = "~/.config/observer-router/secrets.env"
+api_key_var = "GEMINI_API_KEY_B"
+
+[providers.local]
+type = "openai"
+url = "http://127.0.0.1:1240/v1/chat/completions"
+model = "local-model"
+serial = true
+ac_only = true
+```
+
+| Field | Types | Default | Meaning |
+| --- | --- | --- | --- |
+| `type` | all | required | `gemini`, `openrouter`, or `openai` |
+| `model` | all | required | Model id sent upstream; for a local server, the id it advertises at `/v1/models` |
+| `url` | all | per type; required for `openai` | Chat-completions URL, `http` or `https` |
+| `budget_s` | all | 18 / 24 / 40 | Seconds allowed to reach the first content delta |
+| `api_key_env` | all | none | Environment variable holding the key; checked first |
+| `api_key_file`, `api_key_var` | all | none | A dotenv file (`NAME=value`), or a JSON object when the path ends `.json`, and the key's name in it; re-read on every request |
+| `site_url`, `app_name` | `openrouter` | empty, `observer-router` | `HTTP-Referer` and `X-Title` attribution |
+| `reasoning_effort` | `openai` | unset | Sent as-is (`"none"` turns Splash thinking off); leave unset for servers that reject unknown fields |
+| `serial` | `openai` | `false` | One request at a time per lane URL |
+| `ac_only` | `openai` | `false` | Skip while on battery |
+| `idle_metrics`, `idle_seconds` | `openai` | none, `30` | Wait for these lanes to be idle first |
+
+`chain` lists instance names in order; without it the tables' order is used. `gemini` and
+`openrouter` instances must name a key source. **Keys never go in the file**: an inline `api_key`
+is rejected, as is any field the instance's type does not know, so a typo cannot be ignored
+silently. Every value is type-checked at start-up (`serial = "false"` is an error, not true), and
+a key that turns out to contain control characters fails its instance without being echoed.
+Environment variables from before the config file (`OBSERVER_LOCAL_*`, `OBSERVER_CURSOR_*`, and
+the like) are ignored, and start-up logs their names. `config.toml` and `*.env` are git-ignored
+in this repository.
+
+Environment overrides (all optional):
 
 | Variable | Default |
 | --- | --- |
+| `OBSERVER_ROUTER_CONFIG` | `~/.config/observer-router/config.toml` |
+| `OBSERVER_ROUTER_CHAIN` | the file's `chain` — comma-separated instance names, e.g. to drop a local lane during a benchmark |
 | `OBSERVER_ROUTER_HOST` / `OBSERVER_ROUTER_PORT` | `127.0.0.1` / `1244` |
-| `OBSERVER_ROUTER_CHAIN` | `gemini,openrouter,local` |
-| `OBSERVER_GEMINI_MODEL` | `gemini-flash-lite-latest` |
-| `OBSERVER_OPENROUTER_MODEL` | `openrouter/free` |
-| `OBSERVER_CURSOR_URL` | `http://127.0.0.1:8765/v1/chat/completions` |
-| `OBSERVER_CURSOR_MODEL` | `composer-2.5` |
-| `OBSERVER_CURSOR_API_KEY` | empty — the bridge's `CURSOR_BRIDGE_API_KEY` |
-| `OBSERVER_CURSOR_ENV_FILE` | empty — env file read for `CURSOR_BRIDGE_API_KEY` |
-| `OBSERVER_LOCAL_MODEL` | `local-model` — set this to your local server's advertised id |
-| `OBSERVER_LOCAL_URL` | `http://127.0.0.1:1243/v1/chat/completions` |
 | `OBSERVER_BREAK_AFTER` / `OBSERVER_BREAK_SECONDS` | `3` / `60` |
-| `OBSERVER_LOCAL_AC_ONLY` | `1` — skip the local tier while on battery |
 | `OBSERVER_POWER_CACHE_SECONDS` | `30` |
-| `OBSERVER_LOCAL_IDLE_METRICS` | empty — gate off; comma-separated `/metrics` URLs of lanes to wait for |
-| `OBSERVER_LOCAL_IDLE_SECONDS` / `OBSERVER_IDLE_SAMPLE_SECONDS` | `30` / `2` |
+| `OBSERVER_IDLE_SAMPLE_SECONDS` | `2` |
 | `OBSERVER_MAX_PROMPT_CHARS` / `OBSERVER_MAX_FIELD_CHARS` | `240000` / `80000` |
 | `OBSERVER_MIN_RETAINED_CHARS` | `1024` |
 | `OBSERVER_BASE64_BLOB_CHARS` | `16384` |
-| `CLAUDE_MEM_SETTINGS` | `~/.claude-mem/settings.json` |
 
 ### Consumer contract
 
-`~/.claude-mem/settings.json` must point at the router, not the lane:
+To use the router as claude-mem's observer, `~/.claude-mem/settings.json` must point at the
+router, not the lane:
 
 ```text
 CLAUDE_MEM_OPENROUTER_BASE_URL = http://127.0.0.1:1244/v1
 CLAUDE_MEM_OPENROUTER_MODEL    = observer-router
 ```
 
-The model id is an alias; the router rewrites it per tier. claude-mem records the tier's real
+The model id is an alias; the router rewrites it per instance. claude-mem records the tier's real
 model in its own `OpenRouter API usage` lines, so the chain is observable from its log.
 
 ## Install
@@ -203,11 +244,12 @@ The router is standard-library only, so any Python 3.11+ works. The reference in
 dedicated venv so the service cannot be disturbed by unrelated package installs.
 
 1. Copy `com.ezou.observer-router.plist` into `~/Library/LaunchAgents/`.
-2. Edit `Label`, both `ProgramArguments` paths, and `PATH` for your machine. Set
-   `OBSERVER_LOCAL_MODEL` here as well: it must match the id your local server advertises at
-   `/v1/models`, or that tier answers 404 and the chain loses its backstop.
-3. Point claude-mem at the router, per [Consumer contract](#consumer-contract) above.
-4. Load it and check health:
+2. Edit `Label`, both `ProgramArguments` paths, and `PATH` for your machine.
+3. Copy `config.example.toml` to `~/.config/observer-router/config.toml` and edit it. A local
+   instance's `model` must match the id the server advertises at `/v1/models`, or it answers 404
+   and the chain loses its backstop.
+4. Point claude-mem at the router, per [Consumer contract](#consumer-contract) above.
+5. Load it and check health:
 
 ```bash
 launchctl bootout gui/$UID/com.ezou.observer-router   # "no such process" is fine on first install
@@ -225,17 +267,15 @@ unloaded, and `KeepAlive` cannot bring back a job that is no longer registered.
 | launchd label | `com.ezou.observer-router` |
 | plist | `~/Library/LaunchAgents/com.ezou.observer-router.plist` (copy kept here) |
 | log | `/tmp/observer-router.log` |
-| health | `curl -fsS http://127.0.0.1:1244/health` — chain, budgets, breaker and quota blocks, prompt guard, power/AC gate, idle gate |
+| config | `~/.config/observer-router/config.toml` |
+| health | `curl -fsS http://127.0.0.1:1244/health` — chain, instances, breaker and quota blocks, prompt guard, power/AC gate, idle gate |
 | models | `curl -fsS http://127.0.0.1:1244/v1/models` |
 
-Exercise one tier in isolation by starting a throwaway instance with the earlier tiers broken:
+Exercise one instance in isolation by starting a throwaway router whose chain names only it:
 
 ```bash
-OBSERVER_ROUTER_PORT=1247 OBSERVER_GEMINI_MODEL=definitely-not-a-model \
-OBSERVER_OPENROUTER_MODEL=bogus/model-not-real \
-OBSERVER_LOCAL_MODEL=<your local model id> \
-  python3 observer-router.py
-# then POST to :1247 — the log shows which tier ended up serving
+OBSERVER_ROUTER_PORT=1247 OBSERVER_ROUTER_CHAIN=cursor python3 observer-router.py
+# then POST to :1247 — the log shows which instance served
 ```
 
 ## Tests
@@ -244,18 +284,18 @@ OBSERVER_LOCAL_MODEL=<your local model id> \
 python3 -m unittest -v test_observer_router.py
 ```
 
-The suite covers prompt compaction — unchanged small messages, image/base64 stripping, and
-bounded history that keeps the system message plus the newest context — the power gate,
-including that an unreadable power source keeps the local tier available, and the cursor tier's
-key resolution, payload, and exemption from the power gate and lane lock — and quota-reset
-parsing for both remote tiers, against the 429 shapes they actually return — and the idle gate:
-in-flight parsing, the grace period, activity between samples, and unreadable lanes.
+The suite covers config loading and validation (named instances, type defaults, the chain and
+its override, and rejection of inline keys, unknown fields and undefined names), per-instance
+request building (key sources, attribution headers, reasoning fields, lane locks), failover
+between two instances of one type through the real HTTP handler against fake upstreams, prompt
+compaction, the power and idle gates, and quota-reset parsing against the 429 shapes Gemini and
+OpenRouter actually return.
 
 ## Known limitations
 
 1. **Free remote quotas are too small for daily observer volume.** Both remote tiers have hard
-   daily caps, so after they expire the local lane is the only tier left unless the cursor
-   tier is enabled.
+   daily caps, so after they expire the local lane is the only instance left unless another
+   instance (a second key, or a bridge) is configured.
 2. **A hung-but-alive local lane still defeats launchd `KeepAlive`.** The prompt guard blocks
    the oversized-prompt trigger, but an unrelated MLX generation-thread failure would still
    need `launchctl kickstart -k`. Router-triggered restart is unimplemented.
@@ -276,9 +316,9 @@ in-flight parsing, the grace period, activity between samples, and unreadable la
 
 ## Scope
 
-- This repository owns the router, its launchd plist, its tests, and its documentation.
-- The local tier is any OpenAI-compatible endpoint: the router sends the id
-  `OBSERVER_LOCAL_MODEL` names, so a different model or server works unchanged. The reference
-  lane is a cache-capped MLX server serving a 4B observer model on `:1243`.
-- claude-mem is third-party. The router needs only two of its settings,
-  `CLAUDE_MEM_OPENROUTER_BASE_URL` and `CLAUDE_MEM_OPENROUTER_MODEL`.
+- This repository owns the router, its launchd plist, the example config, its tests, and its
+  documentation.
+- An `openai` instance is any OpenAI-compatible endpoint: the router sends the `model` its table
+  names, so a different model or server works unchanged.
+- claude-mem is third-party and optional. The router reads nothing from it; as a client it needs
+  only `CLAUDE_MEM_OPENROUTER_BASE_URL` and `CLAUDE_MEM_OPENROUTER_MODEL` pointed here.

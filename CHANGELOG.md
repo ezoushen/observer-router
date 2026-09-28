@@ -4,6 +4,32 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-09-29 — config file with named provider instances
+
+### Changed
+
+- **Providers come from a TOML config file**, `OBSERVER_ROUTER_CONFIG` (default
+  `~/.config/observer-router/config.toml`); `config.example.toml` is the template. Each
+  `[providers.<name>]` table is an instance of type `gemini`, `openrouter`, or `openai`, several
+  instances may share a type, and `chain` orders them by name. Breakers and quota blocks are
+  per instance. `OBSERVER_ROUTER_CHAIN` still overrides the chain, now by instance name.
+- **Keys are referenced, never inlined**: `api_key_env`, or `api_key_file` + `api_key_var`
+  (dotenv, or JSON when the path ends `.json`; in dotenv the last assignment wins). An inline
+  `api_key`, unknown fields, and wrongly typed values are rejected at start-up; an invalid config
+  exits with status 2.
+- **The GPU-lane gates are per instance**: `serial`, `ac_only`, `idle_metrics`, and
+  `idle_seconds` on `openai` instances. `/health` reports `providers`, `power.ac_only`, and
+  `idle_gate.<name>`.
+
+### Removed
+
+- The router no longer reads claude-mem's `settings.json` for keys, nor the per-tier
+  environment variables `OBSERVER_GEMINI_MODEL`, `OBSERVER_OPENROUTER_MODEL`, `OBSERVER_CURSOR_*`,
+  `OBSERVER_LOCAL_URL`, `OBSERVER_LOCAL_MODEL`, `OBSERVER_LOCAL_REASONING_EFFORT`,
+  `OBSERVER_LOCAL_SERIAL`, `OBSERVER_LOCAL_AC_ONLY`, `OBSERVER_LOCAL_IDLE_METRICS`,
+  `OBSERVER_LOCAL_IDLE_SECONDS`, and `CLAUDE_MEM_SETTINGS`. Their values move into the config
+  file; an `api_key_file` may still point at claude-mem's settings.
+
 ## 2026-09-24 — cursor tier, quota-reset blocks, and the idle gate
 
 ### Added

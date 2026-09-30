@@ -4,6 +4,21 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-09-30 — group-wide overload block
+
+### Added
+
+- **An overloaded model blocks its whole group.** An HTTP 503 from a group member, or two members
+  timing out in a row with their full budget, skips every member for `OBSERVER_BREAK_SECONDS`, so a
+  Gemini "high demand" outage costs one or two budgets instead of one per key. Quota 429s stay per
+  member.
+
+### Fixed
+
+- **A stream that stalls after its headers now fails over.** The read timeout used to escape
+  the handler and drop the client connection; it is now a failed attempt before the first
+  content delta, and the chain moves on.
+
 ## 2026-09-30 — chat template arguments
 
 ### Added

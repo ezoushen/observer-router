@@ -587,6 +587,8 @@ def configure(config: Config, chain: tuple[str, ...] | None = None) -> None:
     CHAIN = tuple(chain or config.chain)
     with _rotation_lock:
         _rotation.clear()
+    with _breaker_lock:
+        _group_timeouts.clear()
 
 
 def chain_providers() -> list[str]:
@@ -806,7 +808,10 @@ def tier_available(name: str) -> bool:
 
 
 def tier_ok(name: str) -> None:
+    group = _group_of(name)
     with _breaker_lock:
+        if group:
+            _group_timeouts[group] = 0
         _failures[name] = 0
         _skip_until[name] = 0.0
         _skip_reason[name] = ""
@@ -950,10 +955,15 @@ class TierFailure(Exception):
     retry_at/quota are set when the provider said which quota ran out and when it resets.
     """
 
-    def __init__(self, message: str, retry_at: float | None = None, quota: str = ""):
+    def __init__(self, message: str, retry_at: float | None = None, quota: str = "",
+                 overloaded: str = ""):
         super().__init__(message)
         self.retry_at = retry_at
         self.quota = quota
+        # Why the model itself, not this key, looks out of capacity: "unavailable" (HTTP 503) or
+        # "timeout" (a socket read timeout that used the provider's whole budget). Every key in
+        # the provider's group would fail the same way. Empty otherwise.
+        self.overloaded = overloaded
 
 
 def payload_for(provider: Provider, body: dict, reasoning_mode: str | None) -> dict:
@@ -1092,6 +1102,12 @@ def _connect(provider: Provider, timeout: float):
     raise TierFailure(f"{provider.name}: refusing non-http(s) URL")
 
 
+def _timeout_kind(provider: Provider, error: BaseException, timeout: float) -> str:
+    """ "timeout" for a read timeout that had the provider's whole budget; a timeout the request
+    deadline cut short says nothing about the provider."""
+    return "timeout" if isinstance(error, TimeoutError) and timeout >= provider.budget else ""
+
+
 def _open(provider: Provider, body: dict, timeout: float, reasoning_mode: str | None):
     parts = urllib.parse.urlsplit(provider.url)
     payload = json.dumps(payload_for(provider, body, reasoning_mode)).encode()
@@ -1103,7 +1119,10 @@ def _open(provider: Provider, body: dict, timeout: float, reasoning_mode: str | 
         response = connection.getresponse()
     except Exception as error:
         connection.close()
-        raise TierFailure(f"{provider.name}: {type(error).__name__}: {error}") from error
+        raise TierFailure(
+            f"{provider.name}: {type(error).__name__}: {error}",
+            overloaded=_timeout_kind(provider, error, timeout),
+        ) from error
     if response.status >= 400:
         try:
             # Bounded but whole: a Gemini 429 names its quota only past the first ~1.5 KB.
@@ -1144,7 +1163,7 @@ def _http_failure(provider: Provider, error: HTTPError) -> TierFailure:
         return TierFailure(
             f"{name}: HTTP {error.code}: quota {quota_name} exhausted", retry_at, quota_name
         )
-    return TierFailure(f"{name}: HTTP {error.code}: {_snippet(error)}")
+    return TierFailure(f"{name}: HTTP {error.code}: {_snippet(error)}", overloaded="unavailable" if error.code == 503 else "")
 
 
 def _is_mandatory_reasoning_error(error: HTTPError) -> bool:
@@ -1169,6 +1188,8 @@ def _open_with_reasoning_retry(
                 return _open(provider, body, timeout, "exclude")
             except HTTPError as retry_error:
                 raise _http_failure(provider, retry_error) from retry_error
+            except TierFailure:
+                raise
             except Exception as retry_error:
                 raise TierFailure(
                     f"{name}: {type(retry_error).__name__}: {retry_error}"
@@ -1199,14 +1220,13 @@ def iter_stream(provider: Provider, body: dict, deadline: float):
 
 
 def _iter_stream_locked(provider, body, deadline, reasoning_mode):
-    response = _open_with_reasoning_retry(
-        provider, body, _budget_left(provider.budget, deadline), reasoning_mode
-    )
+    timeout = _budget_left(provider.budget, deadline)
+    response = _open_with_reasoning_retry(provider, body, timeout, reasoning_mode)
 
     served = None
     saw_content = False
     try:
-        for raw in response:
+        for raw in _lines_until_content(provider, response, timeout, lambda: saw_content):
             line = raw.decode("utf-8", "ignore").strip()
             if not line.startswith("data: "):
                 continue
@@ -1232,16 +1252,38 @@ def _iter_stream_locked(provider, body, deadline, reasoning_mode):
         raise TierFailure(f"{provider.name}: stream produced no content")
 
 
+def _lines_until_content(provider: Provider, response, timeout: float, committed):
+    """Yield the response's lines. A read error before the first content delta -- an upstream that
+    sent its headers and then stalled -- becomes a TierFailure, so the chain can still fail over;
+    after it, the error propagates to the committed stream's handler."""
+    lines = iter(response)
+    while True:
+        try:
+            raw = next(lines)
+        except StopIteration:
+            return
+        except (OSError, http.client.HTTPException) as error:
+            if committed():
+                raise
+            raise TierFailure(
+                f"{provider.name}: {type(error).__name__} before first content: {error}",
+                overloaded=_timeout_kind(provider, error, timeout),
+            ) from error
+        yield raw
+
+
 def nonstream(provider: Provider, body: dict, deadline: float):
     """Return (response_dict, content) for a provider, or raise TierFailure."""
     with lane_guard(provider):
-        response = _open_with_reasoning_retry(
-            provider, body, _budget_left(provider.budget, deadline), _reasoning_mode(provider)
-        )
+        timeout = _budget_left(provider.budget, deadline)
+        response = _open_with_reasoning_retry(provider, body, timeout, _reasoning_mode(provider))
         try:
             payload = json.load(response)
         except Exception as error:
-            raise TierFailure(f"{provider.name}: unreadable response: {error}") from error
+            raise TierFailure(
+                f"{provider.name}: unreadable response: {error}",
+                overloaded=_timeout_kind(provider, error, timeout),
+            ) from error
         finally:
             response.close()
     choice = (payload.get("choices") or [{}])[0]
@@ -1256,8 +1298,44 @@ def nonstream(provider: Provider, body: dict, deadline: float):
 def record_failure(tier: str, failure: TierFailure) -> None:
     if failure.retry_at:
         tier_quota_exhausted(tier, failure.retry_at, failure.quota)
-    else:
-        tier_failed(tier, str(failure))
+        return
+    tier_failed(tier, str(failure))
+    group = _group_of(tier)
+    if group is None or not failure.overloaded:
+        return
+    if failure.overloaded == "timeout":
+        # One timeout is ordinary tail latency (a budget sits near the p99); two members timing
+        # out in a row, with no success between, is the model.
+        with _breaker_lock:
+            _group_timeouts[group] = _group_timeouts.get(group, 0) + 1
+            if _group_timeouts[group] < GROUP_TIMEOUTS_TO_BLOCK:
+                return
+            _group_timeouts[group] = 0
+    group_overloaded(group, str(failure))
+
+
+# Consecutive member timeouts, per group, that block the group; any member's success resets it.
+GROUP_TIMEOUTS_TO_BLOCK = 2
+_group_timeouts: dict[str, int] = {}
+
+
+def _group_of(tier: str) -> str | None:
+    return next((name for name, members in GROUPS.items() if tier in members), None)
+
+
+def group_overloaded(group: str, reason: str) -> None:
+    """Skip every member of the group for BREAK_SECONDS.
+
+    The members are keys for one model, so a model that is out of capacity fails them all; trying
+    each in turn only spends every member's budget before the chain moves on. A quota block
+    already in place is kept (_skip never shortens one).
+    """
+    until = time.time() + BREAK_SECONDS
+    note = f"group {group} overloaded ({reason[:120]})"
+    with _breaker_lock:
+        blocked = [member for member in GROUPS[group] if _skip(member, until, note)]
+    if blocked:
+        log(f"group {group} overloaded: skipping {','.join(blocked)} for {BREAK_SECONDS:.0f}s")
 
 
 # --- HTTP surface --------------------------------------------------------------

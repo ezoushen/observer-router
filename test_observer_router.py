@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -326,10 +327,10 @@ class ActiveConfigTestCase(unittest.TestCase):
     """Restores the active configuration after each test."""
 
     def setUp(self):
-        self.saved_config = (router.PROVIDERS, router.CHAIN)
+        self.saved_config = (router.PROVIDERS, router.CHAIN, router.GROUPS)
 
     def tearDown(self):
-        router.PROVIDERS, router.CHAIN = self.saved_config
+        router.PROVIDERS, router.CHAIN, router.GROUPS = self.saved_config
 
 
 class PowerGateTests(ActiveConfigTestCase):
@@ -478,6 +479,44 @@ class RequestBuildingTests(unittest.TestCase):
             router.api_key(self._provider(api_key_file=path, api_key_var="Q")), "quoted # kept"
         )
         self.assertEqual(router.api_key(self._provider(api_key_file=path, api_key_var="R")), "r")
+
+    def test_a_timeout_shortened_by_the_request_deadline_is_not_an_overload(self):
+        slow = FakeUpstream(body={"choices": [{"message": {"content": "x"}}]}, delay=2.0)
+        try:
+            provider = self._provider(url=slow.url, budget_s=4)
+
+            with self.assertRaises(router.TierFailure) as caught:
+                router.nonstream(provider, {"messages": []}, deadline=router.time.time() + 1)
+        finally:
+            slow.close()
+        self.assertFalse(caught.exception.overloaded)
+
+    def test_a_full_budget_timeout_is_an_overload(self):
+        slow = FakeUpstream(body={"choices": [{"message": {"content": "x"}}]}, delay=2.0)
+        try:
+            provider = self._provider(url=slow.url, budget_s=1)
+
+            with self.assertRaises(router.TierFailure) as caught:
+                router.nonstream(provider, {"messages": []}, deadline=router.time.time() + 60)
+        finally:
+            slow.close()
+        self.assertTrue(caught.exception.overloaded)
+
+    def test_an_openrouter_retry_that_times_out_keeps_the_overload_flag(self):
+        router.os.environ["TEST_KEY_A"] = "k"
+        upstream = FakeUpstream(script=[
+            (400, {"error": {"message": "Reasoning is mandatory for this endpoint"}}, 0.0),
+            (200, {"choices": [{"message": {"content": "x"}}]}, 2.0),
+        ])
+        try:
+            provider = self._provider(type="openrouter", url=upstream.url, budget_s=1,
+                                      api_key_env="TEST_KEY_A")
+
+            with self.assertRaises(router.TierFailure) as caught:
+                router.nonstream(provider, {"messages": []}, deadline=router.time.time() + 60)
+        finally:
+            upstream.close()
+        self.assertTrue(caught.exception.overloaded)
 
     def test_keyless_openai_provider_sends_no_authorization(self):
         self.assertNotIn("Authorization", router.headers_for(self._provider()))
@@ -753,8 +792,11 @@ class IdleGateTests(ActiveConfigTestCase):
 class FakeUpstream:
     """An OpenAI-compatible upstream that answers every POST with one scripted reply."""
 
-    def __init__(self, status=200, body=None, stream_pieces=None):
+    def __init__(self, status=200, body=None, stream_pieces=None, delay=0.0, stall=0.0, script=()):
+        """delay holds back the whole reply; stall sends the headers, then holds back the body.
+        script lists (status, body, delay) replies for the first requests, in order."""
         self.status, self.body, self.stream_pieces = status, body, stream_pieces
+        self.delay, self.stall, self.script = delay, stall, list(script)
         self.requests: list[tuple[dict, dict]] = []
         upstream = self
 
@@ -765,7 +807,9 @@ class FakeUpstream:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 upstream.requests.append((dict(self.headers), json.loads(self.rfile.read(length))))
-                if upstream.stream_pieces is not None and upstream.status == 200:
+                status, body, delay = (upstream.script.pop(0) if upstream.script
+                                       else (upstream.status, upstream.body, upstream.delay))
+                if upstream.stream_pieces is not None and status == 200:
                     frames = "".join(
                         f"data: {json.dumps({'model': 'fake', 'choices': [{'delta': delta}]})}\n\n"
                         for delta in upstream.stream_pieces
@@ -773,13 +817,19 @@ class FakeUpstream:
                     data = frames.encode()
                     content_type = "text/event-stream"
                 else:
-                    data = json.dumps(upstream.body).encode()
+                    data = json.dumps(body).encode()
                     content_type = "application/json"
-                self.send_response(upstream.status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                time.sleep(delay)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.flush()
+                    time.sleep(upstream.stall)
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # the router gave up on this upstream
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -933,7 +983,7 @@ class ChainTests(ActiveConfigTestCase):
         self.assertEqual(fallback.requests, [])
 
     def test_a_failing_member_retries_inside_the_group_before_falling_back(self):
-        first = self._upstream(status=503, body={"error": "down"})
+        first = self._upstream(status=500, body={"error": "broken key"})
         second = self._upstream(body=_completion("from b"))
         fallback = self._upstream(body=_completion("fallback"))
         self._pool(first, second, fallback)
@@ -943,6 +993,93 @@ class ChainTests(ActiveConfigTestCase):
 
         self.assertEqual(answers, ["from b", "from b"])
         self.assertEqual(fallback.requests, [])
+
+    def _pool_of(self, members: list[FakeUpstream], fallback: FakeUpstream, budget=12) -> None:
+        names = [f"gemini-{index}" for index in range(len(members))]
+        router.configure(router.parse_config({
+            "chain": ["pool", "fallback"],
+            "providers": {
+                **{name: {"type": "gemini", "url": upstream.url, "model": name, "budget_s": budget,
+                          "api_key_env": "TEST_GEMINI_A"}
+                   for name, upstream in zip(names, members)},
+                "fallback": {"type": "openai", "url": fallback.url, "model": "f"},
+            },
+            "groups": {"pool": {"members": names}},
+        }))
+
+    def test_an_overloaded_member_blocks_its_whole_group(self):
+        overloaded = self._upstream(status=503, body=[{"error": {
+            "code": 503, "status": "UNAVAILABLE",
+            "message": "This model is currently experiencing high demand."}}])
+        siblings = [self._upstream(body=_completion("sibling")) for _ in range(2)]
+        fallback = self._upstream(body=_completion("fallback"))
+        self._pool_of([overloaded, *siblings], fallback)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "fallback")
+        self.assertEqual([len(s.requests) for s in siblings], [0, 0])
+        breaker = self._get_health()["breaker"]
+        self.assertTrue(all("overloaded" in breaker[f"gemini-{i}"]["reason"] for i in range(3)),
+                        breaker)
+
+    def test_one_timeout_moves_on_to_the_next_member_without_blocking_the_group(self):
+        slow = self._upstream(body=_completion("late"), delay=3.0)
+        sibling = self._upstream(body=_completion("sibling"))
+        fallback = self._upstream(body=_completion("fallback"))
+        self._pool_of([slow, sibling], fallback, budget=1)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "sibling")
+        self.assertEqual(self._get_health()["breaker"]["gemini-1"]["reason"], "")
+
+    def test_two_members_timing_out_in_a_row_block_the_group(self):
+        slow = [self._upstream(body=_completion("late"), delay=3.0) for _ in range(2)]
+        sibling = self._upstream(body=_completion("sibling"))
+        fallback = self._upstream(body=_completion("fallback"))
+        self._pool_of([*slow, sibling], fallback, budget=1)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "fallback")
+        self.assertEqual(sibling.requests, [])
+        self.assertIn("overloaded", self._get_health()["breaker"]["gemini-2"]["reason"])
+
+    def test_a_stall_after_content_is_committed_does_not_block_the_group(self):
+        first = self._upstream(stream_pieces=[{"content": "hel"}], stall=0.0)
+        sibling = self._upstream(stream_pieces=[{"content": "sibling"}])
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        self._pool_of([first, sibling], fallback, budget=1)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertIn("hel", raw.decode())
+        self.assertEqual(fallback.requests, [])
+        self.assertEqual(self._get_health()["breaker"]["gemini-1"]["reason"], "")
+
+    def test_a_stream_that_stalls_after_its_headers_fails_over(self):
+        stalled = self._upstream(stream_pieces=[{"content": "late"}], stall=3.0)
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        self._pool_of([stalled], fallback, budget=1)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertEqual(status, 200)
+        self.assertIn("fallback", raw.decode())
+
+    def test_a_quota_429_blocks_only_that_member(self):
+        exhausted = self._upstream(status=429, body=json.loads(_gemini_429(
+            ["GenerateRequestsPerDayPerProjectPerModel-FreeTier"]))[0])
+        sibling = self._upstream(body=_completion("sibling"))
+        fallback = self._upstream(body=_completion("fallback"))
+        self._pool_of([exhausted, sibling], fallback)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "sibling")
+        self.assertEqual(self._get_health()["breaker"]["gemini-1"]["reason"], "")
 
     def test_health_reports_groups_and_their_members(self):
         self._pool(self._upstream(body={}), self._upstream(body={}), self._upstream(body={}))

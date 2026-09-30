@@ -72,9 +72,10 @@ default a slow chain is cut off after 30 s and the later instances never answer;
 
 claude-mem sends `stream=true`, so the router speaks SSE with chunked transfer encoding.
 Response headers are deliberately withheld until the **first content-bearing delta** arrives;
-that keeps failover possible right up to the moment the stream commits. Once committed, a
-mid-stream failure cannot switch tiers — it is logged and the stream is closed with
-`data: [DONE]`.
+that keeps failover possible right up to the moment the stream commits. An upstream that sends its
+own headers and then stalls past its budget is a failed attempt, like one that never answers.
+Once committed, a mid-stream failure cannot switch tiers — it is logged and the stream is closed
+with `data: [DONE]`.
 
 ## Prompt safety and context folding
 
@@ -221,6 +222,16 @@ chain = ["gemini", "openrouter", "local"]
 [groups.gemini]
 members = ["gemini-a", "gemini-b", "gemini-c"]   # request 1 starts at a, request 2 at b, ...
 ```
+
+A group's members are usually keys for one model, so an **overloaded model** blocks the whole
+group for the breaker interval (`OBSERVER_BREAK_SECONDS`, 60 s) and the chain moves on at once,
+instead of spending each member's budget in turn:
+
+- an HTTP 503 from any member blocks the group immediately;
+- a socket read timeout blocks it only when two members time out in a row, since one timeout is
+  ordinary tail latency. Any member's success resets the count, and a timeout counts only when the
+  member had its whole budget, not one the request deadline had already cut short;
+- a quota 429 still blocks only the member whose key ran out.
 
 The rotation position is in memory and starts again at the first member after a restart. `/health`
 lists each group's members under `groups`, and every member's breaker under `breaker`. `gemini` and

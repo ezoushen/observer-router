@@ -144,6 +144,12 @@ class ConfigTests(unittest.TestCase):
             "metrics as a string": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
                                     'model = "m"\nidle_metrics = "http://h/metrics"\n',
                                     "idle_metrics"),
+            "template kwargs not a table": (
+                '[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
+                'chat_template_kwargs = "enable_thinking=false"\n', "chat_template_kwargs"),
+            "template kwargs on a remote type": (
+                '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\n'
+                'chat_template_kwargs = {enable_thinking = false}\n', "chat_template_kwargs"),
             "https metrics": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
                               'idle_metrics = ["https://h/metrics"]\n', "idle_metrics"),
             "non-string url": ('[providers.x]\ntype = "openai"\nurl = 123\nmodel = "m"\n', "url"),
@@ -497,6 +503,15 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertNotIn("seed", payload)
         self.assertNotIn("reasoning", payload)
         self.assertNotIn("reasoning_effort", payload)
+
+    def test_chat_template_kwargs_are_sent_as_configured(self):
+        provider = self._provider(chat_template_kwargs={"enable_thinking": False})
+
+        payload = router.payload_for(provider, {"messages": []}, None)
+
+        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
+        self.assertNotIn("chat_template_kwargs", router.payload_for(self._provider(),
+                                                                    {"messages": []}, None))
 
     def test_reasoning_effort_only_when_configured(self):
         payload = router.payload_for(self._provider(reasoning_effort="none"), {"messages": []}, None)

@@ -205,6 +205,7 @@ ac_only = true
 | `api_key_file`, `api_key_var` | all | none | A dotenv file (`NAME=value`), or a JSON object when the path ends `.json`, and the key's name in it; re-read on every request |
 | `site_url`, `app_name` | `openrouter` | empty, `observer-router` | `HTTP-Referer` and `X-Title` attribution |
 | `reasoning_effort` | `openai` | unset | Sent as-is (`"none"` turns Splash thinking off); leave unset for servers that reject unknown fields |
+| `chat_template_kwargs` | `openai` | unset | Sent as-is, e.g. `{ enable_thinking = false }` for Qwen on mtplx or vLLM, which ignore `reasoning_effort` |
 | `serial` | `openai` | `false` | One request at a time per lane URL |
 | `ac_only` | `openai` | `false` | Skip while on battery |
 | `idle_metrics`, `idle_seconds` | `openai` | none, `30` | Wait for these lanes to be idle first |

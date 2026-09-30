@@ -70,6 +70,7 @@ url = "http://127.0.0.1:1240/v1/chat/completions"
 model = "local-model"
 budget_s = 70
 reasoning_effort = "none"   # sent as-is; omit for servers that reject unknown fields (mlx_lm)
+# chat_template_kwargs = { enable_thinking = false }   # Qwen on mtplx/vLLM, which ignore the above
 serial = true               # one request at a time per lane URL
 ac_only = true              # skipped while a laptop runs on battery
 # Wait until these interactive lanes' Prometheus /metrics (Splash counters) have been idle for

@@ -361,7 +361,8 @@ _TYPE_FIELDS = {
     "gemini": {},
     "openrouter": {"site_url": "str", "app_name": "str"},
     # The GPU-lane gates only make sense for a lane on this machine, so only openai has them.
-    "openai": {"reasoning_effort": "str", "serial": "bool", "ac_only": "bool",
+    "openai": {"reasoning_effort": "str", "chat_template_kwargs": "table",
+               "serial": "bool", "ac_only": "bool",
                "idle_metrics": "urls", "idle_seconds": "seconds"},
 }
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -386,6 +387,7 @@ class Provider:
     site_url: str = ""
     app_name: str = "observer-router"
     reasoning_effort: str = ""
+    chat_template_kwargs: dict | None = None
     serial: bool = False
     ac_only: bool = False
     idle_metrics: tuple[str, ...] = ()
@@ -416,6 +418,7 @@ def _check_field(where: str, field: str, kind: str, value) -> None:
         "str": lambda v: isinstance(v, str),
         "name": lambda v: isinstance(v, str) and _NAME.fullmatch(v) is not None,
         "bool": lambda v: isinstance(v, bool),
+        "table": lambda v: isinstance(v, dict),
         "seconds": lambda v: (isinstance(v, (int, float)) and not isinstance(v, bool)
                               and math.isfinite(v) and v > 0),
         "url": lambda v: isinstance(v, str) and _http_url(v),
@@ -426,7 +429,7 @@ def _check_field(where: str, field: str, kind: str, value) -> None:
     }[kind](value)
     if not valid:
         expected = {
-            "str": "a string", "bool": "true or false", "seconds": "a positive number",
+            "str": "a string", "bool": "true or false", "table": "a table, e.g. {k = v}", "seconds": "a positive number",
             "name": "a variable name (letters, digits, underscore), not the key itself",
             "url": "an http(s) URL with a host", "urls": "a list of http:// URLs",
         }[kind]
@@ -969,6 +972,10 @@ def payload_for(provider: Provider, body: dict, reasoning_mode: str | None) -> d
         # the router then reports as "empty content". Unset for lanes that reject unknown
         # fields (mlx_lm does).
         payload["reasoning_effort"] = provider.reasoning_effort
+    if provider.chat_template_kwargs:
+        # For servers that ignore reasoning_effort but render the template themselves (mtplx,
+        # vLLM): {enable_thinking = false} is what turns Qwen thinking off there.
+        payload["chat_template_kwargs"] = provider.chat_template_kwargs
     if provider.type == "openrouter" and reasoning_mode == "disabled":
         # Without this, reasoning models burn the whole budget on reasoning and
         # return empty content.

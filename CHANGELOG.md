@@ -4,6 +4,13 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-09-30 — chat template arguments
+
+### Added
+
+- **`chat_template_kwargs`** on `openai` providers, sent as-is. Qwen served by mtplx ignores
+  `reasoning_effort` and returns empty content until `{ enable_thinking = false }` is passed here.
+
 ## 2026-09-29 — rotating provider groups
 
 ### Added

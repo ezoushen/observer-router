@@ -4,24 +4,23 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
-## 2026-10-27 — Python tooling for the markdown lint
+## 2026-10-27 — standard-library documentation check
 
 ### Changed
 
-- **The markdown linter is `pymarkdownlnt`, installed with pip, not `markdownlint-cli2` through
-  npm.** The router and its tests never used Node. `requirements-dev.txt` pins the linter and its
-  dependencies, `.pymarkdown` holds the rules (the same limits as before: 100-column prose,
-  tables, code blocks and headings exempt), and `scripts/lint-md` runs it with no arguments. It
-  replaces `package.json`, `package-lock.json`, `.markdownlint.json` and
-  `.markdownlint-cli2.jsonc`; `npm test` was only an alias for the Python suite.
-- **Stricter in one place:** a wrapped line may not start with `#` (an issue number, say). Three
-  documents were re-wrapped to meet it, without changing a word. One append-only journal entry
-  that has such lines is left out of the scan, by name, in `scripts/lint-md`.
-- **Two rules differ.** `pymarkdownlnt` has no rule for undefined reference links (`MD052`), so a
-  `[text][name]` with no `[name]:` definition is no longer reported; it also flags
-  non-descriptive link text, which the old linter did not.
-- **Editors that read `.markdownlint.json`** no longer find it; the markdownlint extension for
-  VS Code needs its own settings, or the pymarkdown extension.
+- **The markdown linter is gone; `docslint.py` replaces it.** The repository now needs nothing
+  installed, not even to check its documentation. `python3 docslint.py`, and the test suite
+  (`test_docslint.py`), enforce the style rules in `AGENTS.md`: 100-column prose with tables, code
+  blocks, headings and references exempt, ATX headings, one H1, blank lines around headings, lists
+  and fences, fences that name a language, no trailing whitespace or doubled blank lines, and no
+  wrapped line starting with punctuation or `#`. It also checks that every relative link and anchor
+  resolves, which the linters never did. `package.json`, `package-lock.json`, `.markdownlint.json`
+  and `.markdownlint-cli2.jsonc` are removed, as is the short-lived pip-installed linter.
+- **It found one real violation the linters missed**, an issue number opening a wrapped line inside
+  a list item; that line was re-wrapped. Three more were fixed earlier, moving line breaks only.
+  One append-only journal entry that has such lines is exempted by name in `docslint.py`.
+- **Not checked any more:** a few generic rules that `AGENTS.md` never stated, such as list-marker
+  style and undefined reference links.
 
 ## 2026-10-27 — idle gate for any server
 

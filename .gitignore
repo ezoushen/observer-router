@@ -8,6 +8,3 @@ __pycache__/
 # Local configuration; config.example.toml is the template
 config.toml
 *.env
-
-# Development environment for the markdown linter (see requirements-dev.txt)
-.venv/

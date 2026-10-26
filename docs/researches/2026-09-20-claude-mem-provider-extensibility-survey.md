@@ -73,9 +73,9 @@ claims to solve rotation would duplicate #3941.
 ### 4. Where such an idea would have to live
 
 - **#2785 / plan-12 "Provider & Extensibility Roadmap"** is the declared home for net-new
-  capability ("not defects"), with a **Providers & auth** sub-area. It already contains
-  #2704 (an `apiKeyHelper` equivalent for refreshable gateway tokens) and #3664 (first-class
-  9router support, folded in).
+  capability ("not defects"), with a **Providers & auth** sub-area. It already contains #2704 (an
+  `apiKeyHelper` equivalent for refreshable gateway tokens) and #3664 (first-class 9router support,
+  folded in).
 - **plan-19 (#3607)** declares an `ObserverSpawnSpec` with an explicit
   `authSource ∈ {env, keychain, credentials.json, apiKey, apiKeyHelper}` — the closest thing to
   a resolution seam that exists in design form.

@@ -79,10 +79,12 @@ You need Python 3.11 or later. Run the commands from the repository root.
 ## Development
 
 ```bash
-python3 -m unittest -v test_observer_router.py                           # tests
-python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt   # once: the markdown linter
-scripts/lint-md                                                          # markdown lint
+python3 -m unittest -v     # the tests, and the check of these documents
+python3 docslint.py        # the documents alone: style rules, and links that must resolve
 ```
+
+Nothing is installed: the router, its tests, and the documentation check use only the standard
+library.
 
 Conventions for contributors and coding agents are in [`AGENTS.md`](AGENTS.md); notable changes
 are in [`CHANGELOG.md`](CHANGELOG.md).

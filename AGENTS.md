@@ -20,9 +20,8 @@ as production changes.
 
 | Purpose | Command |
 | --- | --- |
-| Install dev tooling | `python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt` — pinned, needed once |
-| Tests | `python3 -m unittest -v test_observer_router.py` |
-| Markdown lint | `scripts/lint-md` — no arguments; rules live in `.pymarkdown` |
+| Tests, and the documentation check | `python3 -m unittest -v` |
+| Documentation check alone | `python3 docslint.py` — no arguments; exit status 1 on a finding |
 | Router health | `curl -fsS http://127.0.0.1:1244/health` |
 | Router models | `curl -fsS http://127.0.0.1:1244/v1/models` |
 | Local lane check | `curl -fsS http://127.0.0.1:1243/v1/models` |
@@ -38,9 +37,8 @@ Exercise one provider in isolation with a throwaway router on another port whose
 | --- | --- |
 | `observer-router.py` | The router. Single file, no third-party imports. |
 | `test_observer_router.py` | Tests for config loading, request building, chain failover over HTTP, cut-off replies and buffered streams, group blocks, compaction, the power and idle gates, and quota blocks. |
-| `scripts/lint-md` | Runs the markdown linter over the repository, with no arguments. |
-| `requirements-dev.txt` | The pinned markdown linter and its dependencies; development only. |
-| `.pymarkdown` | The markdown rules. |
+| `docslint.py` | Checks the Markdown against the style rules below and that relative links resolve. Standard library only. |
+| `test_docslint.py` | Tests for `docslint.py`, and the check of this repository's own documentation. |
 | `config.example.toml` | The documented config template. The live config is `~/.config/observer-router/config.toml`, outside the repository. |
 | `com.ezou.observer-router.plist` | launchd deployment: interpreter and script paths. |
 | `docs/README.md` | Index of all documentation. |
@@ -53,8 +51,9 @@ Exercise one provider in isolation with a throwaway router on another port whose
 
 ## Code conventions
 
-- **Standard library only.** No third-party runtime dependencies; the router must start when a
-  lane or network is unhealthy and no package install is possible.
+- **Standard library only, and nothing to install.** No third-party dependency of any kind, for the
+  router, its tests, or its documentation check. The router must start when a lane or network is
+  unhealthy and no package install is possible, and a contributor needs only Python.
 - **Keep prompt compaction deterministic.** It must never call another model, so it still works
   when every upstream quota is exhausted.
 - **Treat an empty tier response as a failure**, never as a result.
@@ -88,13 +87,16 @@ Exercise one provider in isolation with a throwaway router on another port whose
 ### Markdown style
 
 - Wrap prose at **100 columns**. Tables, code blocks, headings, and links are exempt.
-- ATX headings, exactly one H1, a blank line around headings, lists, and fences.
+- ATX headings, exactly one H1, a blank line around headings, lists, and fences, and a language
+  on every code fence. No doubled blank lines, and exactly one newline at the end of a file.
 - **No trailing whitespace.** Use a blank line instead of a two-space hard break.
 - **Never let a wrapped line start with punctuation or `#`**: punctuation attaches to the previous
   token, and a line starting with `#` renders as a heading.
 - Use reference links for long or repeated links, especially inside tables.
-- Run the linter before committing; `.pymarkdown` holds the rules. It also refuses a wrapped line
-  that starts with `#`, such as an issue number.
+- Run `python3 docslint.py` (the test suite runs it too) before committing. It enforces the rules
+  above, which includes refusing a wrapped line that starts with `#`, such as an issue number, and
+  it checks that every relative link and anchor resolves. It knows fenced code only: write code
+  blocks with fences, not by indenting.
 
 ## Production safety
 

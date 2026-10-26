@@ -44,6 +44,7 @@ ac_only = true
 | `ac_only` | `openai` | `false` | Skip while on battery |
 | `buffer_stream` | all | `false` | Hold a stream back until it ends, so a reply cut off at the token limit fails over |
 | `idle_metrics`, `idle_seconds` | `openai` | none, `30` | Wait for these lanes to be idle first |
+| `idle_signal` | `openai` | Splash's request counters | Which `/metrics` names mean the lane is busy, as counters or gauges ([naming the metrics](gates.md#naming-the-metrics)); needs `idle_metrics` |
 | `max_prompt_chars` | all | router-wide `OBSERVER_MAX_PROMPT_CHARS` | Fold the prompt to this many characters for this provider only; can only tighten the router-wide guard ([sizing](prompt-guard.md#sizing-a-limit-for-one-provider)) |
 | `break_after` | all | router-wide `OBSERVER_BREAK_AFTER` | Failures in a row before this provider is skipped |
 | `break_seconds` | all | router-wide `OBSERVER_BREAK_SECONDS` | How long it is skipped, by its own breaker or a group block |

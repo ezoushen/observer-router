@@ -227,11 +227,11 @@ def power_source() -> str:
 # can say when. An unreadable lane leaves its last reading in place and ages into idle, so a
 # stopped or broken lane cannot keep the observer offline.
 IDLE_SAMPLE_SECONDS = _env_float("OBSERVER_IDLE_SAMPLE_SECONDS", 2.0, 0.1, 3600.0)
-_IN_FLIGHT_COUNTERS = {
-    "splash_requests_submitted_total": 1,
-    "splash_requests_completed_total": -1,
-    "splash_requests_cancelled_total": -1,
-    "splash_requests_failed_total": -1,
+# What counts as busy when a provider sets no idle_signal: Splash's request counters.
+SPLASH_SIGNAL = {
+    "submitted": "splash_requests_submitted_total",
+    "finished": ["splash_requests_completed_total", "splash_requests_cancelled_total",
+                 "splash_requests_failed_total"],
 }
 
 _idle_lock = threading.Lock()
@@ -239,20 +239,37 @@ _idle_lock = threading.Lock()
 _lane_activity: dict[str, dict] = {}
 
 
-def parse_lane_metrics(text: str) -> tuple[int, int] | None:
-    """Return (submitted, in_flight) from a Splash /metrics body, or None when unreadable."""
-    values = {}
+def parse_lane_metrics(text: str, signal: dict | None = None) -> tuple[int | None, int] | None:
+    """Return (submitted, in_flight) from a Prometheus /metrics body, or None when a named metric
+    is missing or unreadable.
+
+    The signal is an idle_signal table: counters, {submitted, finished}, give in-flight as
+    submitted minus the finished counters; gauges, {in_flight}, are summed (a labelled gauge
+    adds up over its label sets) and have no submitted count, so None stands for it.
+    """
+    signal = signal or SPLASH_SIGNAL
+    wanted = set(signal["in_flight"] if "in_flight" in signal
+                 else [signal["submitted"], *signal["finished"]])
+    values: dict[str, float] = {}
     for line in text.splitlines():
-        name, _, value = line.partition(" ")
-        if name in _IN_FLIGHT_COUNTERS:
+        if not line or line.startswith("#"):
+            continue
+        head, _, value = line.rstrip().rpartition(" ")
+        name = head.rstrip().partition("{")[0]
+        if name in wanted:
             try:
-                values[name] = int(float(value))
+                values[name] = values.get(name, 0.0) + float(value)
             except ValueError:
                 return None
-    if len(values) != len(_IN_FLIGHT_COUNTERS):
+    if wanted - values.keys():
         return None
-    in_flight = sum(values[name] * sign for name, sign in _IN_FLIGHT_COUNTERS.items())
-    return values["splash_requests_submitted_total"], in_flight
+    try:
+        if "in_flight" in signal:
+            return None, int(sum(values.values()))
+        submitted = int(values[signal["submitted"]])
+        return submitted, submitted - int(sum(values[name] for name in signal["finished"]))
+    except (ValueError, OverflowError):  # NaN, infinity: not a reading
+        return None
 
 
 def record_lane_sample(url: str, sample: tuple[int, int] | None, now: float) -> None:
@@ -267,7 +284,7 @@ def record_lane_sample(url: str, sample: tuple[int, int] | None, now: float) -> 
         state["submitted"] = submitted
 
 
-def _read_lane(url: str) -> tuple[int, int] | None:
+def _read_lane(url: str, signal: dict | None = None) -> tuple[int | None, int] | None:
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != "http" or not parts.hostname:
         return None
@@ -277,7 +294,7 @@ def _read_lane(url: str) -> tuple[int, int] | None:
         response = connection.getresponse()
         if response.status != 200:
             return None
-        return parse_lane_metrics(response.read().decode("utf-8", "ignore"))
+        return parse_lane_metrics(response.read().decode("utf-8", "ignore"), signal)
     except Exception:  # an unreachable lane is not activity
         return None
     finally:
@@ -291,10 +308,21 @@ def watched_lanes() -> tuple[str, ...]:
     ))
 
 
+def lane_signal(url: str) -> dict | None:
+    """The idle_signal of the first provider in the chain that watches this URL (config loading
+    rejects two providers reading one URL differently); None means the Splash counters."""
+    return next((PROVIDERS[name].idle_signal for name in chain_providers()
+                 if url in PROVIDERS[name].idle_metrics), None)
+
+
+def sample_lanes_once() -> None:
+    for url in watched_lanes():
+        record_lane_sample(url, _read_lane(url, lane_signal(url)), time.time())
+
+
 def _sample_lanes_forever() -> None:
     while True:
-        for url in watched_lanes():
-            record_lane_sample(url, _read_lane(url), time.time())
+        sample_lanes_once()
         time.sleep(IDLE_SAMPLE_SECONDS)
 
 
@@ -401,7 +429,7 @@ _TYPE_FIELDS = {
     # The GPU-lane gates only make sense for a lane on this machine, so only openai has them.
     "openai": {"reasoning_effort": "str", "chat_template_kwargs": "table",
                "serial": "bool", "ac_only": "bool",
-               "idle_metrics": "urls", "idle_seconds": "seconds"},
+               "idle_metrics": "urls", "idle_seconds": "seconds", "idle_signal": "table"},
 }
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -438,6 +466,7 @@ class Provider:
     break_seconds: float = 0.0  # 0: OBSERVER_BREAK_SECONDS
     idle_metrics: tuple[str, ...] = ()
     idle_seconds: float = 30.0
+    idle_signal: dict | None = None  # which /metrics names mean busy; None: the Splash counters
 
 
 @dataclass(frozen=True)
@@ -523,12 +552,48 @@ def _provider(name: str, table) -> Provider:
         fields["break_seconds"] = float(fields["break_seconds"])
     # The guard keeps a message only if it can keep MIN_RETAINED_CHARS of it, and a prompt needs
     # room for a system message and the request it carries.
+    if "idle_signal" in fields:
+        if not fields.get("idle_metrics"):
+            raise ConfigError(f"{where}: idle_signal needs idle_metrics, the lanes it is read from")
+        fields["idle_signal"] = _idle_signal(where, fields["idle_signal"])
     floor = max(2 * MIN_RETAINED_CHARS, 1)
     if fields.get("max_prompt_chars", floor) < floor:
         raise ConfigError(f"{where}: max_prompt_chars must be at least {floor}, enough to keep "
                           "a system message and the request")
     budget = float(table.get("budget_s", _TYPE_DEFAULTS[kind]["budget_s"]))
     return Provider(name=name, budget=budget, **fields)
+
+
+_METRIC_NAME = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")
+
+
+def _idle_signal(where: str, value: dict) -> dict:
+    """Check an idle_signal table: counters {submitted, finished}, or gauges {in_flight}."""
+    counters, gauges = {"submitted", "finished"}, {"in_flight"}
+    unknown = set(value) - counters - gauges
+    if unknown:
+        raise ConfigError(f"{where}: idle_signal has unknown key(s): {', '.join(sorted(unknown))}")
+    if ("in_flight" in value) == bool(set(value) & counters):
+        raise ConfigError(f"{where}: idle_signal must set exactly one of in_flight, or "
+                          "submitted with finished")
+    if set(value) & counters and set(value) != counters:
+        raise ConfigError(f"{where}: idle_signal counters need both submitted and finished")
+
+    def names(key: str, listed) -> list[str]:
+        items = [listed] if key == "submitted" else listed
+        if not isinstance(items, list) or not items or not all(
+                isinstance(item, str) and _METRIC_NAME.fullmatch(item) for item in items):
+            kind = "a metric name" if key == "submitted" else "a non-empty list of metric names"
+            raise ConfigError(f"{where}: idle_signal {key} must be {kind}")
+        return items
+
+    result = {key: names(key, value[key]) for key in value}
+    listed = [*result.get("finished", []), *result.get("in_flight", [])]
+    if len(set(listed)) != len(listed):
+        raise ConfigError(f"{where}: idle_signal names a metric more than once")
+    if "submitted" in result:
+        result["submitted"] = result["submitted"][0]
+    return result
 
 
 def parse_config(data: dict) -> Config:
@@ -539,11 +604,24 @@ def parse_config(data: dict) -> Config:
     if not isinstance(tables, dict) or not tables:
         raise ConfigError("config defines no [providers.<name>] tables")
     providers = {name: _provider(name, table) for name, table in tables.items()}
+    _check_lane_signals(providers)
     groups = _groups(data.get("groups", {}), providers)
     chain = data.get("chain", list(providers))
     if not isinstance(chain, list) or not chain or not all(isinstance(n, str) for n in chain):
         raise ConfigError("chain must be a non-empty list of provider or group names")
     return Config(providers, _checked_chain(chain, providers, groups, "chain"), groups)
+
+
+def _check_lane_signals(providers: dict) -> None:
+    """One /metrics URL is sampled once, so every provider that watches it must name the same
+    signal."""
+    seen: dict[str, tuple[str, dict | None]] = {}
+    for name, provider in providers.items():
+        for url in provider.idle_metrics:
+            other = seen.setdefault(url, (name, provider.idle_signal))
+            if other[1] != provider.idle_signal:
+                raise ConfigError(f"idle_metrics URL {url} is read two ways, by providers "
+                                  f"{other[0]} and {name}: give both the same idle_signal")
 
 
 def _names(where: str, names, providers: dict) -> tuple[str, ...]:
@@ -620,13 +698,29 @@ _REMOVED_ENV_PREFIXES = ("OBSERVER_LOCAL_", "OBSERVER_CURSOR_", "OBSERVER_GEMINI
                          "OBSERVER_OPENROUTER_")
 
 
+def _is_loopback(host: str | None) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host or "").is_loopback
+    except ValueError:
+        return False
+
+
 def provider_warnings(providers: dict) -> list[str]:
     """Settings that parse but never act, so /health must not be read as if they did."""
-    return [
+    warnings = [
         f"providers.{name}: max_prompt_chars {provider.max_prompt_chars} is above the router-wide "
         f"OBSERVER_MAX_PROMPT_CHARS {MAX_PROMPT_CHARS}, which already bounds every prompt first"
         for name, provider in providers.items() if provider.max_prompt_chars > MAX_PROMPT_CHARS
     ]
+    for name, provider in providers.items():
+        if provider.ac_only and not _is_loopback(urllib.parse.urlsplit(provider.url).hostname):
+            warnings.append(
+                f"providers.{name}: ac_only reads the battery of the machine running the "
+                "router, but url names another host, so it cannot see that host's power"
+            )
+    return warnings
 
 
 def stale_environment(env) -> list[str]:

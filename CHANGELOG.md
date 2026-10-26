@@ -4,6 +4,17 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-27 — idle gate for any server
+
+### Added
+
+- **`idle_signal`** on a provider names the `/metrics` counters (`submitted` and `finished`) or
+  gauges (`in_flight`, summed over label sets) that mean a lane is busy, so the idle gate works
+  for vLLM or any Prometheus-style server, not only Splash. Unset, the Splash counters apply.
+  One URL read two ways by two providers is a config error.
+- **A start-up warning for `ac_only` on a provider whose `url` names another host**: the power
+  gate reads the router's own battery, so it cannot see that host's.
+
 ## 2026-10-27 — per-provider limits
 
 ### Added

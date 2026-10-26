@@ -896,6 +896,161 @@ class IdleGateTests(ActiveConfigTestCase):
         self.assertIsNone(router.busy_reason(router.PROVIDERS["local"]))
 
 
+VLLM_METRICS = """# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{{model_name="m"}} {running}
+vllm:num_requests_waiting{{model_name="m"}} {waiting}
+vllm:cache_usage_perc{{model_name="m"}} 0.4
+"""
+VLLM_SIGNAL = {"in_flight": ["vllm:num_requests_running", "vllm:num_requests_waiting"]}
+CUSTOM_COUNTERS = {"submitted": "lane_started_total", "finished": ["lane_done_total", "lane_err_total"]}
+
+
+class IdleSignalTests(ActiveConfigTestCase):
+    """idle_signal says which /metrics names mean a lane is busy, so a lane that is not Splash can
+    be watched; unset, the Splash counters apply."""
+
+    def test_counters_can_be_named(self):
+        text = "lane_started_total 50\nlane_done_total 40\nlane_err_total 3\n"
+
+        self.assertEqual(router.parse_lane_metrics(text, CUSTOM_COUNTERS), (50, 7))
+
+    def test_gauges_with_labels_are_summed_as_in_flight(self):
+        text = VLLM_METRICS.format(running="2.0", waiting="1.0")
+
+        self.assertEqual(router.parse_lane_metrics(text, VLLM_SIGNAL), (None, 3))
+
+    def test_a_gauge_with_several_label_sets_adds_them_up(self):
+        # Rule: a server that reports one gauge per model is busy when any model is.
+        text = ('vllm:num_requests_running{model_name="a"} 1.0\n'
+                'vllm:num_requests_running{model_name="b"} 2.0\n')
+
+        self.assertEqual(router.parse_lane_metrics(text, {"in_flight": ["vllm:num_requests_running"]}),
+                         (None, 3))
+
+    def test_trailing_and_doubled_spaces_do_not_make_a_lane_unreadable(self):
+        # Rule: whitespace the server adds around a value must not stop the gate gating; the
+        # Splash body parsed with it before idle_signal existed.
+        text = ("splash_requests_submitted_total 1011 \n"
+                "splash_requests_completed_total  1000\n"
+                "splash_requests_cancelled_total 10\t\n"
+                "splash_requests_failed_total 0\n")
+
+        self.assertEqual(router.parse_lane_metrics(text), (1011, 1))
+
+    def test_a_value_that_is_not_finite_makes_the_lane_unreadable(self):
+        # Rule: NaN, infinity or an absurd number is an unreadable lane, never an exception.
+        for value in ("NaN", "+Inf", "1e400"):
+            with self.subTest(value):
+                text = SPLASH_METRICS.format(submitted=value, completed=1000)
+                self.assertIsNone(router.parse_lane_metrics(text))
+                gauge = f'vllm:num_requests_running {value}\nvllm:num_requests_waiting 0\n'
+                self.assertIsNone(router.parse_lane_metrics(gauge, VLLM_SIGNAL))
+
+    def test_a_named_gauge_that_is_missing_makes_the_lane_unreadable(self):
+        self.assertIsNone(router.parse_lane_metrics("vllm:num_requests_running 0\n", VLLM_SIGNAL))
+
+    def test_a_gauge_lane_is_busy_only_while_something_is_in_flight(self):
+        # Rule: with no submitted counter, in-flight work is the only activity; a lane at zero
+        # is idle once the grace period has passed.
+        url = "http://127.0.0.1:8000/metrics"
+        router._lane_activity.clear()
+        self.addCleanup(router._lane_activity.clear)
+        _use({"lane": {**LANE, "ac_only": False, "idle_metrics": [url], "idle_seconds": 30,
+                       "idle_signal": VLLM_SIGNAL}})
+        lane = router.PROVIDERS["lane"]
+
+        router.record_lane_sample(url, (None, 1), now=1_000.0)
+        self.assertEqual(router.busy_lanes(lane, now=1_029.0), [url])
+        router.record_lane_sample(url, (None, 0), now=1_010.0)
+        self.assertEqual(router.busy_lanes(lane, now=1_040.0), [])
+
+    def test_a_lane_is_read_with_its_providers_signal(self):
+        # Rule: the sampler reads each URL with the signal of the provider that watches it, end
+        # to end over HTTP.
+        class Metrics(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_GET(self):
+                body = VLLM_METRICS.format(running="1.0", waiting="0.0").encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Metrics)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/metrics"
+        _use({"lane": {**LANE, "ac_only": False, "idle_metrics": [url],
+                       "idle_signal": VLLM_SIGNAL}})
+
+        signal = router.lane_signal(url)
+
+        self.assertEqual(signal, VLLM_SIGNAL)
+        self.assertEqual(router._read_lane(url, signal), (None, 1))
+        self.assertIsNone(router._read_lane(url, None))  # the Splash names are not on this lane
+        router._lane_activity.clear()
+        self.addCleanup(router._lane_activity.clear)
+        router.sample_lanes_once()  # what the background sampler does each pass
+        self.assertEqual(router.busy_lanes(router.PROVIDERS["lane"]), [url])
+
+    def test_a_lane_without_idle_signal_is_read_as_splash(self):
+        url = "http://127.0.0.1:1240/metrics"
+        _use({"lane": {**LANE, "ac_only": False, "idle_metrics": [url]}})
+
+        self.assertIsNone(router.lane_signal(url))
+
+    def test_invalid_idle_signals_are_rejected_with_the_reason(self):
+        base = ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
+                'idle_metrics = ["http://h:1/metrics"]\n')
+        cases = {
+            "without idle_metrics": (
+                '[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
+                'idle_signal = {in_flight = ["a"]}\n', "idle_signal needs idle_metrics"),
+            "both shapes": (base + 'idle_signal = {in_flight = ["a"], submitted = "b", '
+                                   'finished = ["c"]}\n', "exactly one of"),
+            "neither shape": (base + 'idle_signal = {}\n', "exactly one of"),
+            "unknown key": (base + 'idle_signal = {in_flight = ["a"], extra = 1}\n',
+                            "unknown key"),
+            "counters need finished": (base + 'idle_signal = {submitted = "a"}\n', "finished"),
+            "names must be metric names": (base + 'idle_signal = {in_flight = ["not a name"]}\n',
+                                           "metric name"),
+            "a name listed twice": (base + 'idle_signal = {submitted = "a", finished = ["b", "b"]}\n',
+                                    "more than once"),
+            "names must be a list": (base + 'idle_signal = {in_flight = "a"}\n', "list"),
+            "on a hosted type": (
+                '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\n'
+                'idle_signal = {in_flight = ["a"]}\n', "for type gemini"),
+            "one url read two ways": (
+                base + 'idle_signal = {in_flight = ["a"]}\n'
+                '[providers.y]\ntype = "openai"\nurl = "http://h/v2"\nmodel = "m"\n'
+                'idle_metrics = ["http://h:1/metrics"]\n', "read two ways"),
+        }
+        for label, (text, needle) in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(router.ConfigError) as caught:
+                    _config(text)
+                self.assertIn(needle, str(caught.exception))
+
+    def test_ac_only_on_another_host_is_warned_about(self):
+        # Rule: ac_only reads this machine's battery, so on a provider whose url names another
+        # host it cannot see that host's power; start-up says so.
+        config = router.parse_config({"providers": {
+            "remote-lane": {"type": "openai", "url": "http://192.0.2.7:8030/v1", "model": "m",
+                            "ac_only": True},
+            "local-lane": {"type": "openai", "url": "http://127.0.0.1:1240/v1", "model": "m",
+                           "ac_only": True},
+            "unlimited": {"type": "openai", "url": "http://192.0.2.7:8030/v1", "model": "m"}}})
+
+        warnings = router.provider_warnings(config.providers)
+
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("remote-lane", warnings[0])
+        self.assertIn("battery", warnings[0])
+
+
 class RequestGuardTests(ActiveConfigTestCase):
     """A web page must not be able to drive the router: it takes neither a Host header that a
     rebound DNS name would carry, nor a POST that is not declared JSON."""

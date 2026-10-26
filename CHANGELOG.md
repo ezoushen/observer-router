@@ -4,6 +4,23 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-27 — per-provider limits
+
+### Added
+
+- **`max_prompt_chars`, `break_after`, `break_seconds`** on any provider. They override the
+  router-wide prompt guard and breaker settings for that provider alone, so a small-context lane
+  can be given a smaller prompt without shrinking it for everyone, and a flaky lane can be skipped
+  sooner. `max_prompt_chars` only tightens the router-wide guard. `/health` lists the overrides
+  that are set. The config file is read at start-up: a change needs a restart, not a new release.
+- **The newest request keeps up to half the prompt budget** when an oversized system message
+  would otherwise use all of it (the request was dropped, and the provider answered anyway).
+  This applies to the router-wide guard too, which only changes prompts that exceed it.
+- **A group block logs each member's interval**, and start-up warns about a `max_prompt_chars`
+  above the router-wide limit, which never acts.
+- **Sizing a limit from the lane**: `docs/reference/prompt-guard.md` shows how to read a lane's
+  context window from `/v1/models` and turn it into a character budget.
+
 ## 2026-10-27 — request guard
 
 ### Security

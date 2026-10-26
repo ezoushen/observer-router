@@ -16,6 +16,8 @@ Everything about the chain lives in one TOML file; the
   `chat_template_kwargs`), stream buffering, and the GPU-lane gates (`serial`, `ac_only`,
   `idle_metrics`) are set per instance, so one chain can mix fast hosted tiers with a slow local
   lane.
+- **Per-provider overrides of that policy.** `max_prompt_chars`, `break_after` and `break_seconds`
+  let one provider differ from the router-wide defaults, for a small-context lane or a flaky one.
 - **Router-wide policy.** Breaker thresholds, the prompt guard, and sampling intervals are
   environment variables with defaults; see the [configuration reference](../reference/configuration.md#environment).
 

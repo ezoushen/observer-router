@@ -5,6 +5,10 @@ it for 60 s (`OBSERVER_BREAK_AFTER`,
 `OBSERVER_BREAK_SECONDS`). Every failed attempt is logged with its reason, so a failing tier
 is visible in the log without reproduction.
 
+Both numbers can be set per provider with `break_after` and `break_seconds` in its config table,
+for a lane that should be skipped after one failure, or a hosted API that deserves more patience.
+A group block skips each member for that member's own interval.
+
 A 429 that states when its quota resets skips the instance until then instead:
 
 - **Gemini** names the exhausted quotas in `google.rpc.QuotaFailure`. Any `PerDay` quota

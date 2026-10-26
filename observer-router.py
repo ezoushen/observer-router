@@ -392,6 +392,8 @@ _COMMON_FIELDS = {
     "type": "str", "url": "url", "model": "str", "budget_s": "seconds",
     "api_key_env": "name", "api_key_file": "str", "api_key_var": "name",
     "buffer_stream": "bool",
+    # Per-provider overrides of router-wide settings; unset, the router-wide value applies.
+    "max_prompt_chars": "count", "break_after": "count", "break_seconds": "seconds",
 }
 _TYPE_FIELDS = {
     "gemini": {},
@@ -406,6 +408,10 @@ _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 class ConfigError(Exception):
     """The config file is missing, unreadable, or describes an unusable chain."""
+
+
+# Provider fields that override a router-wide setting; /health shows the ones that are set.
+_OVERRIDES = ("max_prompt_chars", "break_after", "break_seconds")
 
 
 @dataclass(frozen=True)
@@ -427,6 +433,9 @@ class Provider:
     serial: bool = False
     ac_only: bool = False
     buffer_stream: bool = False
+    max_prompt_chars: int = 0  # 0: only the router-wide guard
+    break_after: int = 0  # 0: OBSERVER_BREAK_AFTER
+    break_seconds: float = 0.0  # 0: OBSERVER_BREAK_SECONDS
     idle_metrics: tuple[str, ...] = ()
     idle_seconds: float = 30.0
 
@@ -455,6 +464,8 @@ def _check_field(where: str, field: str, kind: str, value) -> None:
         "str": lambda v: isinstance(v, str),
         "name": lambda v: isinstance(v, str) and _NAME.fullmatch(v) is not None,
         "bool": lambda v: isinstance(v, bool),
+        "count": lambda v: (isinstance(v, int) and not isinstance(v, bool)
+                            and 1 <= v <= 1_000_000_000),
         "table": lambda v: isinstance(v, dict),
         "seconds": lambda v: (isinstance(v, (int, float)) and not isinstance(v, bool)
                               and math.isfinite(v) and v > 0),
@@ -466,7 +477,7 @@ def _check_field(where: str, field: str, kind: str, value) -> None:
     }[kind](value)
     if not valid:
         expected = {
-            "str": "a string", "bool": "true or false", "table": "a table, e.g. {k = v}", "seconds": "a positive number",
+            "str": "a string", "bool": "true or false", "count": "a whole number from 1", "table": "a table, e.g. {k = v}", "seconds": "a positive number",
             "name": "a variable name (letters, digits, underscore), not the key itself",
             "url": "an http(s) URL with a host", "urls": "a list of http:// URLs",
         }[kind]
@@ -508,6 +519,14 @@ def _provider(name: str, table) -> Provider:
         fields["idle_metrics"] = tuple(str(url) for url in fields["idle_metrics"])
     if "idle_seconds" in fields:
         fields["idle_seconds"] = float(fields["idle_seconds"])
+    if "break_seconds" in fields:
+        fields["break_seconds"] = float(fields["break_seconds"])
+    # The guard keeps a message only if it can keep MIN_RETAINED_CHARS of it, and a prompt needs
+    # room for a system message and the request it carries.
+    floor = max(2 * MIN_RETAINED_CHARS, 1)
+    if fields.get("max_prompt_chars", floor) < floor:
+        raise ConfigError(f"{where}: max_prompt_chars must be at least {floor}, enough to keep "
+                          "a system message and the request")
     budget = float(table.get("budget_s", _TYPE_DEFAULTS[kind]["budget_s"]))
     return Provider(name=name, budget=budget, **fields)
 
@@ -599,6 +618,15 @@ def chain_override(config: Config, text: str) -> tuple[str, ...]:
 # now does nothing, so start-up names them rather than ignoring them silently.
 _REMOVED_ENV_PREFIXES = ("OBSERVER_LOCAL_", "OBSERVER_CURSOR_", "OBSERVER_GEMINI_",
                          "OBSERVER_OPENROUTER_")
+
+
+def provider_warnings(providers: dict) -> list[str]:
+    """Settings that parse but never act, so /health must not be read as if they did."""
+    return [
+        f"providers.{name}: max_prompt_chars {provider.max_prompt_chars} is above the router-wide "
+        f"OBSERVER_MAX_PROMPT_CHARS {MAX_PROMPT_CHARS}, which already bounds every prompt first"
+        for name, provider in providers.items() if provider.max_prompt_chars > MAX_PROMPT_CHARS
+    ]
 
 
 def stale_environment(env) -> list[str]:
@@ -742,8 +770,12 @@ def _clean_content(content, stats: dict) -> str:
     return _clean_text(str(content), stats) if content is not None else ""
 
 
-def compact_messages(messages: list[dict]) -> tuple[list[dict], dict]:
-    """Return a bounded conversation while preserving system and newest context."""
+def compact_messages(messages: list[dict], limit: int | None = None) -> tuple[list[dict], dict]:
+    """Return a bounded conversation while preserving system and newest context.
+
+    limit is the character budget; by default the router-wide OBSERVER_MAX_PROMPT_CHARS.
+    """
+    limit = MAX_PROMPT_CHARS if limit is None else limit
     stats = {
         "changed": False,
         "input_chars": _message_chars(messages),
@@ -762,7 +794,7 @@ def compact_messages(messages: list[dict]) -> tuple[list[dict], dict]:
         cleaned["content"] = _clean_content(message.get("content"), stats)
         sanitized.append(cleaned)
 
-    if _message_chars(sanitized) <= MAX_PROMPT_CHARS:
+    if _message_chars(sanitized) <= limit:
         stats["output_chars"] = _message_chars(sanitized)
         stats["changed"] = sanitized != messages
         return sanitized, stats
@@ -778,24 +810,49 @@ def compact_messages(messages: list[dict]) -> tuple[list[dict], dict]:
     # that the observer is meant to answer.
     priority = system_indexes[:1] + recent_indexes[:1] + system_indexes[1:] + recent_indexes[1:]
     selected = {}
-    remaining = MAX_PROMPT_CHARS
+    remaining = limit
+    # The newest non-system message is the request the model must answer, so an oversized
+    # system message may not take the whole budget: up to half is held back for it.
+    newest = recent_indexes[0] if recent_indexes else None
+    reserved = 0
+    if newest is not None and system_indexes:
+        reserved = min(_content_chars(sanitized[newest].get("content")), remaining // 2)
     for index in priority:
         message = dict(sanitized[index])
         size = _content_chars(message.get("content"))
-        if size <= remaining:
+        if index == newest:
+            reserved = 0
+        available = remaining - reserved
+        if size <= available:
             selected[index] = message
             remaining -= size
-        elif remaining >= MIN_RETAINED_CHARS:
-            message["content"] = _fold_text(str(message.get("content") or ""), remaining)
+        elif available >= MIN_RETAINED_CHARS:
+            message["content"] = _fold_text(str(message.get("content") or ""), available)
             selected[index] = message
             stats["folded_fields"] += 1
-            remaining = 0
+            remaining -= available
 
     compacted = [selected[index] for index in sorted(selected)]
     stats["dropped_messages"] += len(sanitized) - len(selected)
     stats["output_chars"] = _message_chars(compacted)
     stats["changed"] = True
     return compacted, stats
+
+
+def fit_prompt(provider: Provider, body: dict) -> dict:
+    """Return the request body sized for this provider: its max_prompt_chars can only tighten the
+    router-wide guard, which has already run, so a provider without one gets the body as is."""
+    limit = provider.max_prompt_chars
+    messages = body.get("messages") or []
+    if not limit or _message_chars(messages) <= limit:
+        return body
+    compacted, stats = compact_messages(messages, limit)
+    log(
+        f"compacted prompt for tier {provider.name} chars={stats['input_chars']}->"
+        f"{stats['output_chars']} dropped_messages={stats['dropped_messages']} "
+        f"folded_fields={stats['folded_fields']}"
+    )
+    return {**body, "messages": compacted}
 
 
 def record_compaction(stats: dict) -> None:
@@ -867,14 +924,25 @@ def _skip(name: str, until: float, reason: str) -> bool:
     return True
 
 
+def _break_after(name: str) -> int:
+    provider = PROVIDERS.get(name)
+    return (provider.break_after if provider else 0) or BREAK_AFTER
+
+
+def _break_seconds(name: str) -> float:
+    provider = PROVIDERS.get(name)
+    return (provider.break_seconds if provider else 0.0) or BREAK_SECONDS
+
+
 def tier_failed(name: str, reason: str) -> None:
+    seconds = _break_seconds(name)
     with _breaker_lock:
         _failures[name] = _failures.get(name, 0) + 1
-        if _failures[name] >= BREAK_AFTER and _skip(
-            name, time.time() + BREAK_SECONDS, "breaker-open"
+        if _failures[name] >= _break_after(name) and _skip(
+            name, time.time() + seconds, "breaker-open"
         ):
             log(
-                f"tier {name} breaker open for {BREAK_SECONDS:.0f}s "
+                f"tier {name} breaker open for {seconds:.0f}s "
                 f"after {_failures[name]} failures ({reason})"
             )
 
@@ -1435,18 +1503,20 @@ def _group_of(tier: str) -> str | None:
 
 
 def group_overloaded(group: str, reason: str) -> None:
-    """Skip every member of the group for BREAK_SECONDS.
+    """Skip every member of the group for its own break interval (BREAK_SECONDS by default).
 
     The members are keys for one model, so a model that is out of capacity fails them all; trying
     each in turn only spends every member's budget before the chain moves on. A quota block
     already in place is kept (_skip never shortens one).
     """
-    until = time.time() + BREAK_SECONDS
+    now = time.time()
     note = f"group {group} overloaded ({reason[:120]})"
     with _breaker_lock:
-        blocked = [member for member in GROUPS[group] if _skip(member, until, note)]
+        blocked = [member for member in GROUPS[group]
+                   if _skip(member, now + _break_seconds(member), note)]
     if blocked:
-        log(f"group {group} overloaded: skipping {','.join(blocked)} for {BREAK_SECONDS:.0f}s")
+        skipped = ",".join(f"{member}({_break_seconds(member):.0f}s)" for member in blocked)
+        log(f"group {group} overloaded: skipping {skipped}")
 
 
 # --- HTTP surface --------------------------------------------------------------
@@ -1527,7 +1597,9 @@ class RouterHandler(BaseHTTPRequestHandler):
                 "groups": {name: list(GROUPS[name]) for name in CHAIN if name in GROUPS},
                 "providers": {
                     name: {"type": PROVIDERS[name].type, "model": PROVIDERS[name].model,
-                           "budget_s": PROVIDERS[name].budget}
+                           "budget_s": PROVIDERS[name].budget,
+                           **{key: getattr(PROVIDERS[name], key) for key in _OVERRIDES
+                              if getattr(PROVIDERS[name], key)}}
                     for name in chain_providers()
                 },
                 "breaker": breaker_snapshot(),
@@ -1610,7 +1682,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 continue
             started = time.time()
             try:
-                generator = iter_stream(provider, body, deadline)
+                generator = iter_stream(provider, fit_prompt(provider, body), deadline)
                 _, served = next(generator)  # blocks until the first content delta
             except StopIteration:
                 tier_failed(tier, "no frames")
@@ -1690,7 +1762,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 continue
             started = time.time()
             try:
-                payload, content = nonstream(provider, body, deadline)
+                payload, content = nonstream(provider, fit_prompt(provider, body), deadline)
             except TierFailure as failure:
                 record_failure(tier, failure)
                 attempted.append(f"{tier}({failure})")
@@ -1746,6 +1818,8 @@ def main() -> None:
     except ConfigError as error:
         log(f"config error: {error}")
         raise SystemExit(2) from None
+    for warning in provider_warnings(PROVIDERS):
+        log(f"warning: {warning}")
     stale = stale_environment(os.environ)
     if stale:
         log(f"ignoring removed environment variable(s), now config fields: {', '.join(stale)}")

@@ -193,6 +193,20 @@ class ConfigTests(unittest.TestCase):
                                      'model = "m"\napi_key_env = "K"\n', "x"),
             "unknown top-level key": ('chian = ["x"]\n[providers.x]\ntype = "gemini"\n'
                                       'model = "m"\napi_key_env = "K"\n', "chian"),
+            "prompt limit not an integer": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
+                                            'model = "m"\nmax_prompt_chars = "96000"\n',
+                                            "max_prompt_chars must be"),
+            "prompt limit below the retained floor": (
+                '[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
+                'max_prompt_chars = 2047\n', "max_prompt_chars must be at least"),
+            "breaker threshold zero": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
+                                       'model = "m"\nbreak_after = 0\n', "break_after must be"),
+            "breaker threshold boolean": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
+                                          'model = "m"\nbreak_after = true\n',
+                                          "break_after must be"),
+            "breaker seconds a string": ('[providers.x]\ntype = "gemini"\nmodel = "m"\n'
+                                         'api_key_env = "K"\nbreak_seconds = "60"\n',
+                                         "break_seconds must be"),
             "gate on a remote type": (
                 '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\nserial = true\n',
                 "serial",
@@ -332,6 +346,35 @@ class PromptCompactionTests(unittest.TestCase):
         self.assertNotIn("old-", combined)
         self.assertTrue(stats["changed"])
         self.assertGreater(stats["dropped_messages"], 0)
+
+
+    def test_an_oversized_system_message_does_not_starve_the_newest_request(self):
+        # Rule: the newest non-system message is the request the model must answer; when the
+        # system message alone would take the whole budget, the request keeps up to half of it.
+        router.MAX_FIELD_CHARS = 100_000  # only the total budget is under test
+        messages = [{"role": "system", "content": "S" * 5_000},
+                    {"role": "user", "content": "Answer this: " + "q" * 600}]
+
+        compacted, _ = router.compact_messages(messages, 2_000)
+
+        self.assertEqual([m["role"] for m in compacted], ["system", "user"])
+        self.assertEqual(compacted[1]["content"], messages[1]["content"])  # small enough: whole
+        self.assertLessEqual(router._message_chars(compacted), 2_000)
+
+    def test_a_request_larger_than_half_the_budget_is_folded_to_half(self):
+        # Rule: the share held for the newest message is at most half, so the system contract
+        # keeps the rest.
+        router.MAX_FIELD_CHARS = 100_000  # only the total budget is under test
+        messages = [{"role": "system", "content": "S" * 5_000},
+                    {"role": "user", "content": "Answer this: " + "q" * 5_000}]
+
+        compacted, _ = router.compact_messages(messages, 4_000)
+
+        sizes = [router._content_chars(m["content"]) for m in compacted]
+        self.assertEqual(len(compacted), 2)
+        self.assertLessEqual(sum(sizes), 4_000)
+        self.assertGreaterEqual(min(sizes), 1_800)  # neither side is starved
+        self.assertTrue(compacted[1]["content"].startswith("Answer this:"))
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -1433,6 +1476,108 @@ class ChainTests(ActiveConfigTestCase):
         self.assertEqual(self._streamed_text(raw), "abc")
         self.assertEqual(fallback.requests, [])
 
+    def _chars_received(self, upstream: FakeUpstream) -> int:
+        return router._message_chars(upstream.requests[0][1]["messages"])
+
+    def test_each_provider_gets_the_prompt_sized_for_it(self):
+        # Rule: max_prompt_chars tightens the router-wide prompt guard for one provider; a
+        # provider without it gets the full, router-bounded prompt on the same request.
+        small = self._upstream(status=503, body={"error": "down"})
+        large = self._upstream(body=_completion("ok"))
+        _use({"small": {"type": "openai", "url": small.url, "model": "s",
+                        "max_prompt_chars": 3_000},
+              "large": {"type": "openai", "url": large.url, "model": "l"}})
+        messages = [{"role": "system", "content": "contract " * 50},
+                    {"role": "user", "content": "x" * 10_000}]
+
+        status, _ = self._post({"messages": messages})
+
+        self.assertEqual(status, 200)
+        self.assertLessEqual(self._chars_received(small), 3_000)
+        self.assertEqual(self._chars_received(large), router._message_chars(messages))
+        self.assertIn("contract", json.dumps(small.requests[0][1]["messages"]))  # system kept
+
+    def test_a_provider_limit_the_router_wide_guard_overrides_is_reported(self):
+        # Rule: a max_prompt_chars above the router-wide limit never acts, and start-up says so
+        # rather than letting /health suggest it does.
+        config = router.parse_config({"providers": {
+            "loose": {"type": "openai", "url": "http://h/v1", "model": "m",
+                      "max_prompt_chars": router.MAX_PROMPT_CHARS + 1},
+            "tight": {"type": "openai", "url": "http://h/v1", "model": "m",
+                      "max_prompt_chars": router.MAX_PROMPT_CHARS}}})
+
+        warnings = router.provider_warnings(config.providers)
+
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("loose", warnings[0])
+        self.assertIn("OBSERVER_MAX_PROMPT_CHARS", warnings[0])
+
+    def test_a_group_block_logs_each_members_interval(self):
+        # Rule: members with different break_seconds are skipped for different times, and the
+        # log line says which.
+        router.configure(router.parse_config({
+            "chain": ["pool"],
+            "providers": {
+                "a": {"type": "openai", "url": "http://h/v1", "model": "m", "break_seconds": 300},
+                "b": {"type": "openai", "url": "http://h/v1", "model": "m"}},
+            "groups": {"pool": {"members": ["a", "b"]}}}))
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            router.group_overloaded("pool", "test")
+
+        self.assertIn("a(300s)", out.getvalue())
+        self.assertIn(f"b({router.BREAK_SECONDS:.0f}s)", out.getvalue())
+
+    def test_a_provider_prompt_limit_above_the_request_changes_nothing(self):
+        # Rule: a limit only acts on a prompt that exceeds it.
+        upstream = self._upstream(body=_completion("ok"))
+        _use({"p": {"type": "openai", "url": upstream.url, "model": "m",
+                    "max_prompt_chars": 50_000}})
+        messages = [{"role": "user", "content": "x" * 10_000}]
+
+        self._post({"messages": messages})
+
+        self.assertEqual(upstream.requests[0][1]["messages"], messages)
+
+    def test_a_provider_breaker_threshold_overrides_the_router_default(self):
+        # Rule: break_after is per provider: one failure skips the strict provider, while the
+        # default provider is still tried until it has failed BREAK_AFTER times.
+        strict = self._upstream(status=500, body={"error": "x"})
+        default = self._upstream(status=500, body={"error": "x"})
+        last = self._upstream(body=_completion("ok"))
+        _use({"strict": {"type": "openai", "url": strict.url, "model": "s", "break_after": 1},
+              "default": {"type": "openai", "url": default.url, "model": "d"},
+              "last": {"type": "openai", "url": last.url, "model": "l"}})
+
+        for _ in range(2):
+            self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual((len(strict.requests), len(default.requests)), (1, 2))
+
+    def test_a_provider_breaker_interval_overrides_the_router_default(self):
+        # Rule: break_seconds sets how long that provider is skipped, for its own breaker and
+        # when a group block skips it.
+        failing = self._upstream(status=500, body={"error": "x"})
+        down = self._upstream(status=503, body={"error": "down"})
+        last = self._upstream(body=_completion("ok"))
+        router.configure(router.parse_config({
+            "chain": ["own", "pool", "last"],
+            "providers": {
+                "own": {"type": "openai", "url": failing.url, "model": "o", "break_after": 1,
+                        "break_seconds": 600},
+                "member": {"type": "gemini", "url": down.url, "model": "m",
+                           "api_key_env": "TEST_GEMINI_A", "break_seconds": 300},
+                "last": {"type": "openai", "url": last.url, "model": "l"},
+            },
+            "groups": {"pool": {"members": ["member"]}},
+        }))
+
+        self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        breaker = self._get_health()["breaker"]
+        self.assertAlmostEqual(breaker["own"]["skipped_for_s"], 600, delta=5)
+        self.assertAlmostEqual(breaker["member"]["skipped_for_s"], 300, delta=5)
+
     def _pool(self, first: FakeUpstream, second: FakeUpstream, fallback: FakeUpstream) -> None:
         router.configure(router.parse_config({
             "chain": ["pool", "fallback"],
@@ -1624,6 +1769,20 @@ class ChainTests(ActiveConfigTestCase):
         self.assertEqual(health["chain"], ["pool", "fallback"])
         self.assertEqual(health["groups"], {"pool": ["gemini-a", "gemini-b"]})
         self.assertEqual(set(health["breaker"]), {"gemini-a", "gemini-b", "fallback"})
+
+    def test_health_shows_a_providers_overrides_only_when_set(self):
+        # Rule: after editing the config and restarting, /health confirms what took effect.
+        upstream = self._upstream(body={})
+        _use({"tuned": {"type": "openai", "url": upstream.url, "model": "m", "max_prompt_chars": 96_000,
+                        "break_after": 2, "break_seconds": 30},
+              "plain": {"type": "openai", "url": upstream.url, "model": "m"}})
+
+        providers = self._get_health()["providers"]
+
+        self.assertEqual(providers["tuned"], {"type": "openai", "model": "m", "budget_s": 40.0,
+                                              "max_prompt_chars": 96_000, "break_after": 2,
+                                              "break_seconds": 30.0})
+        self.assertEqual(providers["plain"], {"type": "openai", "model": "m", "budget_s": 40.0})
 
     def test_health_lists_each_instance_in_chain_order(self):
         self._two_geminis(self._upstream(body={}), self._upstream(body={}))

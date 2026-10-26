@@ -85,3 +85,11 @@ ac_only = true              # skipped while a laptop runs on battery
 # idle_seconds before using this lane.
 # idle_metrics = ["http://127.0.0.1:1241/metrics"]
 # idle_seconds = 30
+# Per-provider overrides of the router-wide settings (any type); unset, the router-wide value
+# applies. Edit the file and restart: nothing here is in the code.
+# max_prompt_chars = 96000    # fold the prompt to this size for this provider only. Size it from
+#                             # the lane: GET <base>/v1/models shows context_length (tokens);
+#                             # (context - reply cap) * ~3.5 chars per token. It only tightens the
+#                             # router-wide OBSERVER_MAX_PROMPT_CHARS, never raises it.
+# break_after = 5             # failures in a row before this provider is skipped
+# break_seconds = 120         # how long it is skipped (also when a group block skips it)

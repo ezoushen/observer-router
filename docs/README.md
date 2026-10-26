@@ -20,6 +20,7 @@ Start with the [README](../README.md) to get a router running. Everything else i
 | [Breakers, quota blocks, and group blocks](reference/breakers-and-quotas.md) | When a provider or a whole group is skipped, and for how long |
 | [Prompt guard](reference/prompt-guard.md) | How every request is bounded before any provider sees it |
 | [GPU-lane gates](reference/gates.md) | The AC-power and idle rules for local lanes |
+| [Security model](reference/security.md) | What the router protects, who can reach it, and what it leaves to you |
 | [Known limitations](reference/limitations.md) | What the router does not handle yet |
 
 ## Why it is this way

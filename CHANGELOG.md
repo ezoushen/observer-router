@@ -4,6 +4,24 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-27 — request guard
+
+### Security
+
+- **A request must carry a `Host` the router can trust.** `localhost`, an IP literal, or a name
+  in the new `OBSERVER_ROUTER_ALLOWED_HOSTS`; anything else is answered `403`. A web page that
+  rebinds its DNS name to `127.0.0.1` could otherwise read `/health` and spend the quotas.
+- **A POST must declare `Content-Type: application/json`**, or it is answered `415`, so a
+  cross-site form or text post cannot drive the router.
+- **Every error sent before the request body is read closes the connection** (`403`, `415`, the
+  `404` for an unknown path, and a `400` for an unusable `Content-Length`), so the unread body is
+  not parsed as the next request. Before, a page could post text to `http://127.0.0.1:1244/x`
+  with a complete JSON POST as its body, and the router served that inner request.
+- **`localhost.`** (a trailing dot) is the same host as `localhost`.
+- **Each refusal is logged** with its status, the request line, and the offending header.
+- **`docs/reference/security.md`** states the model, including that the log file is readable by
+  every local account.
+
 ## 2026-10-26 — documentation split into docs/
 
 ### Documentation

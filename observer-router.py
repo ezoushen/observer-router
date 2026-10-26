@@ -53,6 +53,7 @@ report AC Power permanently, making that gate inert there.
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -120,6 +121,20 @@ def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 1_000_000
     return _env_number(name, default, int, minimum, maximum)
 
 
+_HOST_NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*")
+
+
+def _env_hosts(name: str) -> tuple[str, ...]:
+    """A comma-separated list of DNS names, lower-cased; an invalid entry stops the router."""
+    names = tuple(part.strip().lower() for part in os.environ.get(name, "").split(",")
+                  if part.strip())
+    for entry in names:
+        if not _HOST_NAME.fullmatch(entry):
+            _ENV_ERRORS.append(f"{name} must be comma-separated DNS names")
+            return ()
+    return names
+
+
 def _env_float(name: str, default: float, minimum: float = 0.0,
                maximum: float = math.inf) -> float:
     return _env_number(name, default, float, minimum, maximum)
@@ -133,6 +148,10 @@ def _now() -> int:
 
 
 PORT = _env_int("OBSERVER_ROUTER_PORT", 1244, 1, 65535)
+# DNS names, besides localhost, that may appear in a request's Host header. A web page reaches the
+# router under a name an attacker's DNS first points here (rebinding); an IP literal cannot be
+# rebound, so those are always accepted and LAN access by address keeps working.
+ALLOWED_HOSTS = _env_hosts("OBSERVER_ROUTER_ALLOWED_HOSTS")
 
 # Circuit breaker: a tier that fails repeatedly is skipped briefly instead of
 # consuming the budget on every call (free tiers rate-limit aggressively).
@@ -1439,11 +1458,39 @@ class RouterHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):  # noqa: A002 - matches base signature
         return  # access lines would drown the tier log
 
-    def _json(self, status: int, payload: dict) -> None:
+    def _host_allowed(self) -> bool:
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host.startswith("["):  # an IPv6 literal, with or without a port
+            return True
+        name = (host.rpartition(":")[0] if host.count(":") == 1 else host).removesuffix(".")
+        try:
+            ipaddress.ip_address(name)
+            return True
+        except ValueError:
+            return not name or name == "localhost" or name in ALLOWED_HOSTS
+
+    def _refuse(self, status: int, message: str, header: str = "") -> None:
+        """Answer an error before the request body is read, then end the connection: an unread
+        body would otherwise be parsed as the next request on a kept-alive connection, which lets
+        a page that may only post text smuggle in a POST that looks like JSON."""
+        self.close_connection = True
+        shown = f": {header}={(self.headers.get(header) or '')[:80]!r}" if header else ""
+        log(f"refused {status} {self.command} {self.path[:80]}{shown}")
+        self._json(status, {"error": message}, close=True)
+
+    def _refuse_foreign_host(self) -> bool:
+        if self._host_allowed():
+            return False
+        self._refuse(403, "host not allowed", "Host")
+        return True
+
+    def _json(self, status: int, payload: dict, close: bool = False) -> None:
         body = json.dumps(payload).encode()
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            if close:
+                self.send_header("Connection", "close")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1470,6 +1517,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         return f"data: {json.dumps(chunk)}\n\n"
 
     def do_GET(self):
+        if self._refuse_foreign_host():
+            return
         route = self.path.rstrip("/")
         if route == "/health":
             self._json(200, {
@@ -1495,13 +1544,24 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self._refuse_foreign_host():
+            return
         if self.path.rstrip("/") != "/v1/chat/completions":
-            self._json(404, {"error": "not found"})
+            self._refuse(404, "not found")
+            return
+        # A cross-site form or text post cannot declare JSON without a CORS preflight, which the
+        # router never answers.
+        if (self.headers.get("Content-Type") or "").split(";")[0].strip().lower() \
+                != "application/json":
+            self._refuse(415, "Content-Type must be application/json", "Content-Type")
             return
         try:
             length = int(self.headers.get("Content-Length") or 0)
-        except Exception:
-            length = 0
+            if length < 0:
+                raise ValueError
+        except ValueError:
+            self._refuse(400, "invalid Content-Length")
+            return
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
         except Exception:

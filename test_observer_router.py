@@ -3,6 +3,7 @@
 tier, and quota-reset blocks."""
 
 import contextlib
+import http.client
 import importlib.util
 import io
 import json
@@ -367,6 +368,7 @@ class EnvironmentTests(unittest.TestCase):
             "integer too big for a float": {"OBSERVER_MAX_PROMPT_CHARS": "9" * 400},
             "blob size past the regex limit": {"OBSERVER_BASE64_BLOB_CHARS": "99999999999"},
             "sample interval too long to sleep": {"OBSERVER_IDLE_SAMPLE_SECONDS": "1e30"},
+            "allowed host that is not a name": {"OBSERVER_ROUTER_ALLOWED_HOSTS": "ok.lan,bad host"},
         }
         for label, env in cases.items():
             with self.subTest(label):
@@ -849,6 +851,166 @@ class IdleGateTests(ActiveConfigTestCase):
         _use({"local": LANE})
 
         self.assertIsNone(router.busy_reason(router.PROVIDERS["local"]))
+
+
+class RequestGuardTests(ActiveConfigTestCase):
+    """A web page must not be able to drive the router: it takes neither a Host header that a
+    rebound DNS name would carry, nor a POST that is not declared JSON."""
+
+    def setUp(self):
+        super().setUp()
+        self.upstream = FakeUpstream(body=_completion("hi"))
+        _use({"p": {"type": "openai", "url": self.upstream.url, "model": "m"}})
+        self.saved_hosts = router.ALLOWED_HOSTS
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), router.RouterHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.port = self.server.server_port
+
+    def tearDown(self):
+        super().tearDown()
+        router.ALLOWED_HOSTS = self.saved_hosts
+        self.server.shutdown()
+        self.server.server_close()
+        self.upstream.close()
+
+    def _call(self, method, path, headers, body=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            connection.request(method, path, body=body, headers=headers)
+            response = connection.getresponse()
+            self.last_connection_header = response.getheader("Connection")
+            return response.status, response.read()
+        finally:
+            connection.close()
+
+    CHAT = json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode()
+
+    def test_a_host_header_naming_another_site_is_refused(self):
+        # Rule: a DNS name that is not localhost or listed reaches the router only through a
+        # rebound page; GET and POST are refused with 403 and no provider is called.
+        for method, path, body in (("GET", "/health", None),
+                                   ("POST", "/v1/chat/completions", self.CHAT)):
+            with self.subTest(method):
+                status, _ = self._call(method, path, {"Host": "evil.example:1244",
+                                                      "Content-Type": "application/json"}, body)
+                self.assertEqual(status, 403)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_a_refusal_closes_the_connection(self):
+        # Rule: a refused POST leaves its body unread, so the connection must not be reused,
+        # or the body would be parsed as the next request.
+        for label, headers in (("host", {"Host": "evil.example", "Content-Type": "application/json"}),
+                               ("type", {"Content-Type": "text/plain"})):
+            with self.subTest(label):
+                self._call("POST", "/v1/chat/completions", headers, self.CHAT)
+                self.assertEqual(self.last_connection_header, "close")
+
+    def _raw(self, payload: bytes) -> bytes:
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as connection:
+            connection.sendall(payload)
+            connection.settimeout(1.0)
+            received = b""
+            try:
+                while chunk := connection.recv(65536):
+                    received += chunk
+            except TimeoutError:
+                pass
+            return received
+
+    def test_a_body_left_unread_is_never_parsed_as_the_next_request(self):
+        # Rule: whatever refuses a POST, its body cannot become a second request on the same
+        # connection. A page can post text to http://127.0.0.1:1244/anything (an IP literal passes
+        # the Host check); if that body were parsed, it would carry the JSON the guard demands.
+        inner = (b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+                 b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n%s"
+                 % (len(self.CHAT), self.CHAT))
+        for label, head in (("unknown path", b"POST /anything HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                              b"Content-Type: text/plain\r\n"),
+                            ("wrong type", b"POST /v1/chat/completions HTTP/1.1\r\n"
+                                           b"Host: 127.0.0.1\r\nContent-Type: text/plain\r\n")):
+            with self.subTest(label):
+                request = head + b"Content-Length: %d\r\n\r\n" % len(inner) + inner
+                answered = self._raw(request).count(b"HTTP/1.")
+                self.assertEqual(answered, 1)
+        self.assertEqual(self.upstream.requests, [])
+
+    def test_an_unusable_content_length_is_refused_and_closes_the_connection(self):
+        # Rule: a Content-Length that is not a non-negative integer cannot say where the body
+        # ends, so the request is refused rather than read as empty and the body left behind.
+        for value in ("abc", "-5"):
+            with self.subTest(value):
+                reply = self._raw(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                  b"Content-Type: application/json\r\nContent-Length: " +
+                                  value.encode() + b"\r\n\r\n{}")
+                self.assertTrue(reply.startswith(b"HTTP/1.1 400"), reply[:80])
+                self.assertIn(b"Connection: close", reply)
+
+    def test_a_refusal_is_logged_with_what_was_refused(self):
+        # Rule: a legitimate client that is turned away must be findable in the log: the status,
+        # the request line, and the offending header, quoted and cut short.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self._call("GET", "/health", {"Host": "evil.example"})
+            self._call("POST", "/v1/chat/completions", {"Content-Type": "text/plain" + "x" * 300},
+                       self.CHAT)
+        lines = [line for line in out.getvalue().splitlines() if "refused" in line]
+        self.assertEqual(len(lines), 2, out.getvalue())
+        self.assertIn("refused 403 GET /health: Host='evil.example'", lines[0])
+        self.assertIn("refused 415 POST /v1/chat/completions: Content-Type='text/plain", lines[1])
+        self.assertNotIn("x" * 150, lines[1])
+
+    def test_a_trailing_dot_does_not_change_the_host(self):
+        # Rule: "localhost." is the same name as "localhost", so a browser that sends it is served;
+        # a listed name is matched the same way, and another name stays refused with or without it.
+        router.ALLOWED_HOSTS = ("router.lan",)
+        for host, expected in (("localhost.:1244", 200), ("router.lan.", 200),
+                               ("evil.example.", 403)):
+            with self.subTest(host):
+                status, _ = self._call("GET", "/health", {"Host": host})
+                self.assertEqual(status, expected)
+
+    def test_only_application_json_itself_is_taken(self):
+        # Rule: a media type that merely starts like it, or lists another, is not JSON.
+        for content_type in ("application/jsonx", "application/json,text/plain",
+                             "text/plain, application/json", "application/x-ndjson",
+                             "application/vnd.api+json"):
+            with self.subTest(content_type):
+                status, _ = self._call("POST", "/v1/chat/completions",
+                                       {"Content-Type": content_type}, self.CHAT)
+                self.assertEqual(status, 415)
+
+    def test_loopback_and_literal_address_hosts_are_served(self):
+        # Rule: an IP literal or localhost cannot be a rebound name, so any of them is served;
+        # this keeps LAN access (a bound address) working.
+        for host in ("localhost:1244", "127.0.0.1:1244", "[::1]:1244", "192.168.1.5:1244",
+                     "127.0.0.1"):
+            with self.subTest(host):
+                status, _ = self._call("GET", "/health", {"Host": host})
+                self.assertEqual(status, 200)
+
+    def test_listed_host_names_are_read_trimmed_and_lower_cased(self):
+        # Rule: OBSERVER_ROUTER_ALLOWED_HOSTS is a comma list; case and spaces do not matter.
+        loaded = _fresh_router({"OBSERVER_ROUTER_ALLOWED_HOSTS": " Router.LAN , nas.local,"})
+        self.assertEqual(loaded.ALLOWED_HOSTS, ("router.lan", "nas.local"))
+
+    def test_a_listed_host_name_is_served(self):
+        # Rule: OBSERVER_ROUTER_ALLOWED_HOSTS names the DNS names that may reach the router.
+        router.ALLOWED_HOSTS = ("router.lan",)
+        status, _ = self._call("GET", "/health", {"Host": "Router.LAN:1244"})
+        self.assertEqual(status, 200)
+
+    def test_a_post_that_is_not_declared_json_is_refused(self):
+        # Rule: a cross-site form or text post carries another type, or none; only
+        # application/json (with any parameters) is taken, so no provider is called otherwise.
+        for label, headers in (("text", {"Content-Type": "text/plain"}),
+                               ("form", {"Content-Type": "application/x-www-form-urlencoded"}),
+                               ("none", {})):
+            with self.subTest(label):
+                status, _ = self._call("POST", "/v1/chat/completions", headers, self.CHAT)
+                self.assertEqual(status, 415)
+        self.assertEqual(self.upstream.requests, [])
+        status, _ = self._call("POST", "/v1/chat/completions",
+                               {"Content-Type": "Application/JSON; charset=utf-8"}, self.CHAT)
+        self.assertEqual(status, 200)
 
 
 class FakeUpstream:

@@ -79,6 +79,7 @@ Integer settings stop at 1,000,000,000.
 | `OBSERVER_ROUTER_CONFIG` | `~/.config/observer-router/config.toml` | a path |
 | `OBSERVER_ROUTER_CHAIN` | the file's `chain` | comma-separated provider or group names, e.g. to drop a local lane during a benchmark |
 | `OBSERVER_ROUTER_HOST` / `OBSERVER_ROUTER_PORT` | `127.0.0.1` / `1244` | an address / an integer 1–65535 |
+| `OBSERVER_ROUTER_ALLOWED_HOSTS` | none | comma-separated DNS names, besides `localhost` and IP literals, accepted in a request's `Host` header; see [security](security.md) |
 | `OBSERVER_BREAK_AFTER` / `OBSERVER_BREAK_SECONDS` | `3` / `60` | an integer ≥ 1 / seconds ≥ 1 |
 | `OBSERVER_GROUP_STRIKES` | `2` | an integer ≥ 1: group members failing in a row, by timeout or unexplained 429, that block the group |
 | `OBSERVER_POWER_CACHE_SECONDS` | `30` | seconds ≥ 0 |

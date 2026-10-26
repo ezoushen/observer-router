@@ -1,0 +1,68 @@
+# Routing and streaming
+
+What counts as an answer, what counts as a failed attempt, and how a streamed reply commits.
+
+## Tier behaviour
+
+- **`openrouter/free` can return empty content.** It rotates across free variants, and a
+  reasoning model can spend the whole `max_tokens` budget on `reasoning`
+  (`finish_reason: length`, `content: ""`). The router injects
+  `{"reasoning":{"enabled":false}}`.
+- **That injection can be refused.** An endpoint may answer
+  `HTTP 400 "Reasoning is mandatory for this endpoint and cannot be disabled."`, so the router
+  retries the same tier once with `{"reasoning":{"exclude":true}}`.
+- **A tier with no content is a failure, not a result.** Streaming or not, an empty answer
+  falls through to the next tier, so claude-mem never records an empty observation.
+- **A reply cut off at the token limit is a failure too.** See
+  [below](#replies-cut-off-at-the-token-limit).
+- **Reasoning deltas are dropped.** Only `delta.content` is forwarded downstream.
+- **A bridge instance authenticates to the bridge, not to the service behind it.** Point its
+  `api_key_file` at the bridge's own env file (for cursor-api-proxy, `CURSOR_BRIDGE_API_KEY`),
+  so the secret has one copy. A configured key source that yields no key fails the instance.
+- **An observer skip looks like a failure.** claude-mem's prompt asks for an empty response
+  when a tool call is routine. A tier that obeys returns empty content, so the next tier runs
+  and may record what the first one skipped.
+
+## Replies cut off at the token limit
+
+`finish_reason: length` means the text stopped mid-thought, or a model looped until its cap.
+
+- **Non-streaming**, the next tier answers.
+- **Streaming**, only an instance with `buffer_stream = true` can fail over
+  ([buffered streams](#buffered-streams)); any other has already forwarded its text, so the
+  stream ends with a `finish_reason: length` frame and the client knows.
+- **When no later tier answers**, the first cut-off reply is served after all, with
+  `finish_reason: length`. claude-mem keeps the complete blocks of a cut-off reply, so part of an
+  answer beats a 502.
+- **One log line** per cut-off, `tier <name> cut off at the token limit: ...`, records
+  `prompt_tokens`, `prompt_chars`, `completion_tokens`, and the first and last 80 characters, so
+  a loop can be told from a genuinely long answer. Those characters are model output, kept in the
+  service log.
+- **Not a breaker failure.** A cut-off depends on the prompt, not the provider's health: a prompt
+  that makes a model loop costs that tier's attempt each time it is sent, but cannot block the
+  tier for other prompts.
+
+Raising the server's token cap is not the fix: a loop only runs longer.
+
+## Streaming contract
+
+claude-mem sends `stream=true`, so the router speaks SSE with chunked transfer encoding.
+Response headers are deliberately withheld until the **first content-bearing delta** arrives;
+that keeps failover possible right up to the moment the stream commits. An upstream that sends its
+own headers and then stalls past its budget is a failed attempt, like one that never answers.
+Once committed, a mid-stream failure cannot switch tiers — it is logged and the stream is closed
+with `data: [DONE]`.
+
+## Buffered streams
+
+An instance with `buffer_stream = true` commits only when its upstream stream has ended. Its text
+is held back until `finish_reason` shows the reply is whole, so a reply cut off at the token
+limit, a stream that ends without a `finish_reason`, a read error at any point, or a reply still
+unfinished when its `budget_s` runs out, still fails over. The budget is a hard bound on the whole
+reply, from the moment the request is sent, so it also frees a `serial` lane that would otherwise
+keep generating for a client that has given up; size it from that client's 90 s idle timeout, not
+from prefill time alone. The cost is latency: claude-mem receives its first byte only once the
+whole reply is generated, and that must happen inside its 90 s stream idle timeout. Turn it on for
+a small local model with a hard output cap, where a cut-off is common and a full reply takes
+seconds; leave it off for fast hosted tiers. Without it, a cut-off stream has already been
+forwarded: it is logged and ends with `finish_reason: length`, and is never recorded as served.

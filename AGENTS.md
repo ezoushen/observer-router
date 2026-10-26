@@ -1,14 +1,15 @@
 # AGENTS.md — working in observer-router
 
-Project instructions for coding agents. `README.md` is for humans and states what the router does
-**today**; the durable decisions live in `docs/plans/` and `docs/researches/`.
+Project instructions for coding agents. `README.md` gets a human from zero to a running router;
+`docs/guides/` and `docs/reference/` state what the router does **today**; the durable decisions
+live in `docs/plans/` and `docs/researches/`.
 
 ## What this repository is
 
 One standard-library Python process that serves an OpenAI-compatible API on `127.0.0.1:1244` and
 fronts claude-mem's observer calls with a fallback chain of named provider instances (types
-`gemini`, `openrouter`, `openai`) read from a TOML config file. The reference chain is Gemini Flash
-→ OpenRouter free → Cursor bridge → local lane.
+`gemini`, `openrouter`, `openai`) read from a TOML config file. This machine's live chain is
+whatever `~/.config/observer-router/config.toml` says; `/health` shows it.
 It exists because claude-mem resolves exactly one provider and has no cross-provider fallback, so
 a dead local lane silently breaks observation.
 
@@ -29,7 +30,7 @@ as production changes.
 | Service log | `/tmp/observer-router.log` |
 
 Exercise one provider in isolation with a throwaway router on another port whose
-`OBSERVER_ROUTER_CHAIN` names only it — see the Operations section of `README.md`.
+`OBSERVER_ROUTER_CHAIN` names only it — see `docs/guides/operations.md`.
 
 ## Layout
 
@@ -39,6 +40,9 @@ Exercise one provider in isolation with a throwaway router on another port whose
 | `test_observer_router.py` | Tests for config loading, request building, chain failover over HTTP, cut-off replies and buffered streams, group blocks, compaction, the power and idle gates, and quota blocks. |
 | `config.example.toml` | The documented config template. The live config is `~/.config/observer-router/config.toml`, outside the repository. |
 | `com.ezou.observer-router.plist` | launchd deployment: interpreter and script paths. |
+| `docs/README.md` | Index of all documentation. |
+| `docs/guides/` | Task-oriented pages: building a chain, claude-mem, install, operations. |
+| `docs/reference/` | Current behaviour, rule by rule: configuration, routing, breakers, prompt guard, gates, limitations. |
 | `docs/researches/` | Investigations: question, method, evidence, conclusion. |
 | `docs/plans/` | Durable plans awaiting or undergoing execution. |
 | `docs/journals/` | Dated work log. Append-only. |
@@ -51,16 +55,21 @@ Exercise one provider in isolation with a throwaway router on another port whose
 - **Keep prompt compaction deterministic.** It must never call another model, so it still works
   when every upstream quota is exhausted.
 - **Treat an empty tier response as a failure**, never as a result.
-- Every config field and environment knob belongs in the README configuration tables, with its
-  default, and every config field in `config.example.toml`.
+- Every config field and environment knob belongs in the tables in
+  `docs/reference/configuration.md`, with its default, and every config field in
+  `config.example.toml`.
 - Machine-specific values (URLs, model ids, key locations) belong in the local config file, not
   in code defaults or the committed example.
 - New behaviour needs a test in `test_observer_router.py`.
 
 ## Documentation conventions
 
-- **`README.md` is current state only.** No dated verification sections, no revision history, no
-  measurement narrative. A rule stays; the measurement that justified it moves to a research doc.
+- **`README.md` is a bootstrap page:** what the router is, a quick start, and links. Detail
+  belongs in `docs/`.
+- **`docs/guides/` and `docs/reference/` are current state only.** No dated verification sections,
+  no revision history, no measurement narrative. A rule stays; the measurement that justified it
+  moves to a research doc. Keep each folder's `README.md` index and `docs/README.md` in step when
+  adding or renaming a page.
 - **`docs/researches/`** — one document per question, with method, evidence, and conclusion.
   **Keep negative results**: they are why a rule exists rather than a rejected alternative.
   Update the index in `docs/researches/README.md` when adding one.

@@ -1,8 +1,8 @@
 # Research records — observer router
 
-Investigations and measurements behind the rules the [README](../../README.md) states. The
-README describes what the router does **now**; these documents record what was measured to
-justify it, including the dead ends.
+Investigations and measurements behind the rules the [guides and reference](../README.md) state.
+Those describe what the router does **now**; these documents record what was measured to justify
+it, including the dead ends.
 
 A journal entry in `docs/journals/` records what was done in a work item. A research document
 here records what was found. They cross-link.
@@ -25,7 +25,9 @@ the source word-for-word (864 of 864 tokens, in order) and all 27 links are iden
 
 What was normalised, and nothing else: line wrapping to this repository's 100-column convention,
 a trailing-space hard break replaced by a blank paragraph break, and a closing
-"Why this matters here" section added to connect the finding to this project. The original file
+"Why this matters here" section added to connect the finding to this project. That added
+section's link to the AC power gate was retargeted from the README to
+`docs/reference/gates.md` when the README was split into `docs/` on 2026-10-26. The original file
 in the wider workspace is untouched.
 
 ## What belongs here

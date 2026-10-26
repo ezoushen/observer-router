@@ -97,7 +97,7 @@ This is the evidence behind the router's premise: claude-mem has no merged cross
 fallback, and its OpenRouter `models[]` support stops at the OpenRouter boundary. Routing
 therefore belongs in a gateway in front of claude-mem — which is what this repository is.
 
-The same research also establishes the retry guarantee that the [AC power gate](../../README.md)
+The same research also establishes the retry guarantee that the [AC power gate](../reference/gates.md)
 leans on: the provider enters a quota cooldown, the queue is preserved, and generation resumes
 when the cooldown clears. See `2026-09-20-claude-mem-retry-and-quota-limits.md` for the
 verification of that behaviour in the installed plugin.

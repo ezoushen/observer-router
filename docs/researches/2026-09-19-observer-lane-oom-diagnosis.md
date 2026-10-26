@@ -41,7 +41,7 @@ Three of the four were the command-buffer variant; one was the absurd single all
 The lane was not leaking. A single oversized prompt drives an allocation that cannot fit, so
 the fix is to bound the request before it reaches any provider, not to tune the cache. That
 conclusion produced the deterministic prompt-size guard described in the
-[README](../../README.md#prompt-safety-and-context-folding).
+[prompt guard reference](../reference/prompt-guard.md).
 
 ## Verification of the fix
 

@@ -4,6 +4,18 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-26 — documentation split into docs/
+
+### Documentation
+
+- **`README.md` is a bootstrap page:** what the router does, a five-step quick start with a
+  minimal config, and links.
+- **`docs/guides/`** (build a chain, use with claude-mem, install, operate) and
+  **`docs/reference/`** (configuration, routing and streaming, breakers and quotas, prompt guard,
+  GPU-lane gates, limitations) hold what the README held, each folder with an index, under a new
+  `docs/README.md`. Research links into the old README now point at the reference pages.
+- **`AGENTS.md`** names the new folders and moves the "current state only" rule to them.
+
 ## 2026-10-26 — configuration consistency
 
 ### Changed

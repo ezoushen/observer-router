@@ -95,18 +95,34 @@ def lane_guard(provider):
         return _lane_locks.setdefault(provider.url, threading.Lock())
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except Exception:
-        return default
+# Invalid OBSERVER_* settings, collected at import and reported by main() before it starts:
+# like a bad config file, a bad setting stops the router instead of silently using the default.
+_ENV_ERRORS: list[str] = []
 
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except Exception:
+def _env_number(name: str, default, kind, minimum, maximum=math.inf):
+    text = os.environ.get(name, "").strip()
+    if not text:  # unset, or set empty (as a plist may leave it): the default
         return default
+    try:
+        value = kind(text)
+    except ValueError:
+        value = None
+    finite = value is not None and (kind is int or math.isfinite(value))
+    if not finite or not minimum <= value <= maximum:
+        bound = f"at least {minimum}" if maximum == math.inf else f"{minimum} to {maximum}"
+        _ENV_ERRORS.append(f"{name} must be {'an integer' if kind is int else 'a number'} {bound}")
+        return default
+    return value
+
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 1_000_000_000) -> int:
+    return _env_number(name, default, int, minimum, maximum)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0,
+               maximum: float = math.inf) -> float:
+    return _env_number(name, default, float, minimum, maximum)
 
 
 def _now() -> int:
@@ -116,12 +132,12 @@ def _now() -> int:
         return 0
 
 
-PORT = _env_int("OBSERVER_ROUTER_PORT", 1244)
+PORT = _env_int("OBSERVER_ROUTER_PORT", 1244, 1, 65535)
 
 # Circuit breaker: a tier that fails repeatedly is skipped briefly instead of
 # consuming the budget on every call (free tiers rate-limit aggressively).
 BREAK_AFTER = _env_int("OBSERVER_BREAK_AFTER", 3)
-BREAK_SECONDS = _env_float("OBSERVER_BREAK_SECONDS", 60.0)
+BREAK_SECONDS = _env_float("OBSERVER_BREAK_SECONDS", 60.0, 1.0)
 
 # The lane's native context is 262,144 tokens, but accepting that many tokens would leave
 # no memory headroom for concurrent GPU clients. Character budgets are conservative token
@@ -129,7 +145,7 @@ BREAK_SECONDS = _env_float("OBSERVER_BREAK_SECONDS", 60.0)
 # summarize an already-oversized request.
 MAX_PROMPT_CHARS = _env_int("OBSERVER_MAX_PROMPT_CHARS", 240_000)
 MAX_FIELD_CHARS = _env_int("OBSERVER_MAX_FIELD_CHARS", 80_000)
-MIN_RETAINED_CHARS = _env_int("OBSERVER_MIN_RETAINED_CHARS", 1_024)
+MIN_RETAINED_CHARS = _env_int("OBSERVER_MIN_RETAINED_CHARS", 1_024, 0)
 BASE64_BLOB_CHARS = _env_int("OBSERVER_BASE64_BLOB_CHARS", 16_384)
 MAX_ERROR_BODY_BYTES = 16_384
 
@@ -191,7 +207,7 @@ def power_source() -> str:
 # finishes between two observer calls still moves the submitted counter, but only a sampler
 # can say when. An unreadable lane leaves its last reading in place and ages into idle, so a
 # stopped or broken lane cannot keep the observer offline.
-IDLE_SAMPLE_SECONDS = _env_float("OBSERVER_IDLE_SAMPLE_SECONDS", 2.0)
+IDLE_SAMPLE_SECONDS = _env_float("OBSERVER_IDLE_SAMPLE_SECONDS", 2.0, 0.1, 3600.0)
 _IN_FLIGHT_COUNTERS = {
     "splash_requests_submitted_total": 1,
     "splash_requests_completed_total": -1,
@@ -356,13 +372,14 @@ _TYPE_DEFAULTS = {
 _COMMON_FIELDS = {
     "type": "str", "url": "url", "model": "str", "budget_s": "seconds",
     "api_key_env": "name", "api_key_file": "str", "api_key_var": "name",
+    "buffer_stream": "bool",
 }
 _TYPE_FIELDS = {
     "gemini": {},
     "openrouter": {"site_url": "str", "app_name": "str"},
     # The GPU-lane gates only make sense for a lane on this machine, so only openai has them.
     "openai": {"reasoning_effort": "str", "chat_template_kwargs": "table",
-               "serial": "bool", "ac_only": "bool", "buffer_stream": "bool",
+               "serial": "bool", "ac_only": "bool",
                "idle_metrics": "urls", "idle_seconds": "seconds"},
 }
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -1390,7 +1407,7 @@ def record_failure(tier: str, failure: TierFailure) -> None:
 
 # Consecutive member timeouts or unexplained 429s, per group, that block the group; any member's
 # success resets it.
-GROUP_STRIKES_TO_BLOCK = 2
+GROUP_STRIKES_TO_BLOCK = _env_int("OBSERVER_GROUP_STRIKES", 2)
 _group_strikes: dict[str, int] = {}
 
 
@@ -1660,6 +1677,9 @@ class RouterHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    if _ENV_ERRORS:
+        log(f"environment error: {'; '.join(_ENV_ERRORS)}")
+        raise SystemExit(2)
     try:
         config = load_config(CONFIG_PATH)
         configure(config, chain_override(config, os.environ.get("OBSERVER_ROUTER_CHAIN", "")))

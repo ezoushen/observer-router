@@ -6,6 +6,8 @@ import contextlib
 import importlib.util
 import io
 import json
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -27,6 +29,22 @@ if SPEC is None or SPEC.loader is None:
 router: Any = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = router  # dataclasses resolve annotations through sys.modules
 SPEC.loader.exec_module(router)
+
+
+def _fresh_router(env: dict) -> Any:
+    """Load a separate copy of the router with these environment variables set at import."""
+    saved = dict(router.os.environ)
+    router.os.environ.update(env)
+    try:
+        spec = importlib.util.spec_from_file_location("observer_router_fresh", MODULE_PATH)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop("observer_router_fresh", None)
+        router.os.environ.clear()
+        router.os.environ.update(saved)
 
 
 def _config(text: str) -> Any:
@@ -313,6 +331,48 @@ class PromptCompactionTests(unittest.TestCase):
         self.assertNotIn("old-", combined)
         self.assertTrue(stats["changed"])
         self.assertGreater(stats["dropped_messages"], 0)
+
+
+class EnvironmentTests(unittest.TestCase):
+    """Router-wide OBSERVER_* settings are checked at start-up, like the config file."""
+
+    def _start(self, env: dict) -> subprocess.CompletedProcess:
+        with socket.socket() as probe:  # a free port, released before the router binds it
+            probe.bind(("127.0.0.1", 0))
+            port = str(probe.getsockname()[1])
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            config.write_text('[providers.x]\ntype = "openai"\nurl = "http://127.0.0.1:9/v1"\n'
+                              'model = "m"\n')
+            clean = {k: v for k, v in router.os.environ.items() if not k.startswith("OBSERVER_")}
+            try:
+                return subprocess.run(
+                    [sys.executable, str(MODULE_PATH)], capture_output=True, text=True, timeout=5,
+                    env={**clean, "OBSERVER_ROUTER_CONFIG": str(config),
+                         "OBSERVER_ROUTER_PORT": port, **env},
+                )
+            except subprocess.TimeoutExpired:
+                self.fail(f"the router started despite {env}")
+
+    def test_an_invalid_setting_stops_the_router_and_names_it(self):
+        # Rule: a value that is not a number, or is out of range, is an error at start-up (exit
+        # 2, the variable named), never a silent fallback to the default.
+        cases = {
+            "not a number": {"OBSERVER_BREAK_AFTER": "three"},
+            "zero strikes": {"OBSERVER_GROUP_STRIKES": "0"},
+            "negative seconds": {"OBSERVER_BREAK_SECONDS": "-1"},
+            "infinite seconds": {"OBSERVER_IDLE_SAMPLE_SECONDS": "inf"},
+            "port out of range": {"OBSERVER_ROUTER_PORT": "70000"},
+            "zero prompt budget": {"OBSERVER_MAX_PROMPT_CHARS": "0"},
+            "integer too big for a float": {"OBSERVER_MAX_PROMPT_CHARS": "9" * 400},
+            "blob size past the regex limit": {"OBSERVER_BASE64_BLOB_CHARS": "99999999999"},
+            "sample interval too long to sleep": {"OBSERVER_IDLE_SAMPLE_SECONDS": "1e30"},
+        }
+        for label, env in cases.items():
+            with self.subTest(label):
+                result = self._start(env)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(next(iter(env)), result.stdout)
 
 
 def _use(tables: dict, chain=None) -> None:
@@ -1318,6 +1378,35 @@ class ChainTests(ActiveConfigTestCase):
         self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "fallback")
         self.assertEqual(sibling.requests, [])
         self.assertIn("overloaded", self._get_health()["breaker"]["gemini-2"]["reason"])
+
+    def test_a_buffered_hosted_provider_fails_over_on_a_cut_off_stream(self):
+        # Rule: buffer_stream is a per-provider stream policy, not a GPU-lane gate, so a hosted
+        # type accepts it too.
+        cut = self._upstream(stream_pieces=[{"content": "echo"}],
+                             finish=("length", {"completion_tokens": 4096}))
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        _use({"gemini-a": {"type": "gemini", "url": cut.url, "model": "m",
+                           "api_key_env": "TEST_GEMINI_A", "buffer_stream": True},
+              "fallback": {"type": "openai", "url": fallback.url, "model": "f"}})
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertEqual(self._streamed_text(raw), "fallback")
+
+    def test_the_group_strike_threshold_is_configurable(self):
+        # Rule: OBSERVER_GROUP_STRIKES sets how many members must fail in a row before the group
+        # is blocked; with 3, two exhausted members still leave the third to answer.
+        self.assertEqual(_fresh_router({"OBSERVER_GROUP_STRIKES": "3"}).GROUP_STRIKES_TO_BLOCK, 3)
+        saved = router.GROUP_STRIKES_TO_BLOCK
+        router.GROUP_STRIKES_TO_BLOCK = 3
+        self.addCleanup(setattr, router, "GROUP_STRIKES_TO_BLOCK", saved)
+        exhausted = [self._upstream(status=429, body=self.EXHAUSTED) for _ in range(2)]
+        sibling = self._upstream(body=_completion("sibling"))
+        self._pool_of([*exhausted, sibling], self._upstream(body=_completion("fallback")))
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "sibling")
 
     def test_one_member_exhausted_does_not_block_the_group(self):
         # Rule: a single unexplained 429 can be one key; its siblings are still tried.

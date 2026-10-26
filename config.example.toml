@@ -24,9 +24,12 @@
 #
 # Common fields: type, model, url (defaults for gemini and openrouter), budget_s (seconds to the
 # first content delta; defaults gemini 18, openrouter 24, openai 40), api_key_env, api_key_file,
-# api_key_var. The sum of the budgets should stay under the client's per-request timeout
-# (claude-mem 13.28: CLAUDE_MEM_LLM_TIMEOUT_MS, 30 s by default, at most 300 s); this example
-# sums to 170 s, so trim the chain or set that timeout to at least 180000.
+# api_key_var, buffer_stream. The budgets of the instances that can fail before the one that
+# answers add up; keep them under the client's deadline. For claude-mem 15.2.1 a streamed call
+# is bound by CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS (90 s by default) until the router's
+# headers arrive, and the whole call by CLAUDE_MEM_LLM_TIMEOUT_MS (180 s by default).
+#
+# The chain below is one example; list your own providers in the order you want them tried.
 
 chain = ["gemini", "openrouter", "cursor", "local"]
 
@@ -73,8 +76,9 @@ reasoning_effort = "none"   # sent as-is; omit for servers that reject unknown f
 # chat_template_kwargs = { enable_thinking = false }   # Qwen on mtplx/vLLM, which ignore the above
 serial = true               # one request at a time per lane URL
 ac_only = true              # skipped while a laptop runs on battery
-# buffer_stream = true      # hold a stream until it ends; a reply cut off at the token limit
-                            # then fails over, at the cost of sending nothing until it is whole.
+# buffer_stream = true      # any type: hold a stream until it ends; a reply cut off at the
+                            # token limit then fails over, at the cost of sending nothing until
+                            # it is whole.
                             # budget_s then bounds the whole reply: keep it under the client's
                             # stream idle timeout (claude-mem: 90 s)
 # Wait until these interactive lanes' Prometheus /metrics (Splash counters) have been idle for

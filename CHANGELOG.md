@@ -4,6 +4,23 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-26 — configuration consistency
+
+### Changed
+
+- **`buffer_stream` is accepted on every provider type**, not only `openai`: it is a stream
+  policy, not a GPU-lane gate, and hosted tiers reach the token limit too. Default unchanged.
+- **`OBSERVER_GROUP_STRIKES`** (default 2) sets how many group members failing in a row block the
+  group; it was a fixed constant beside the configurable breaker settings.
+- **Invalid `OBSERVER_*` settings stop the router at start-up** (exit status 2, the variable
+  named), as an invalid config file does. A value that was not a number used to fall back to the
+  default silently, and an out-of-range one, such as `OBSERVER_GROUP_STRIKES=0`, was accepted.
+
+### Documentation
+
+- **The README is about building a chain**, not the reference deployment's: providers, order,
+  groups, per-instance behaviour and router-wide policy, with example chains.
+
 ## 2026-10-26 — unexplained 429s block a group
 
 ### Changed

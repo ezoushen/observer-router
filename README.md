@@ -1,57 +1,80 @@
 # Observer router — an OpenAI-compatible provider chain
 
-OpenAI-compatible router that fronts claude-mem's observer calls, so an observer request
-survives a dead local lane. One process, standard library only, on `127.0.0.1:1244`. The chain
-is a config file of named provider instances, so it works for any OpenAI-compatible client and
-needs nothing from claude-mem.
+One OpenAI-compatible endpoint in front of any providers you choose. You name the provider
+instances, put them in the order to try, and the router answers each request from the first one
+that returns usable content. It was built for claude-mem's observer calls, but any
+OpenAI-compatible client works. One process, standard library only, listening on
+`127.0.0.1:1244` by default.
 
 ## Why this exists
 
-claude-mem resolves exactly one provider and has no cross-provider fallback of its own, so a
-dead lane silently breaks observation. The local lane can keep answering `/v1/models` after
-its generation thread is gone, which means the process still looks alive to launchd and
-`KeepAlive` never fires.
+claude-mem resolves exactly one provider and has no cross-provider fallback of its own, so when
+that provider fails, observation silently stops. A local lane can even keep answering
+`/v1/models` after its generation thread is gone, so the process still looks alive to launchd.
 
-The router removes that single point of failure by putting two remote hops, plus an optional
-Cursor bridge, in front of the lane, treating any tier that returns no content as a failed
-attempt, and bounding every request before any provider sees it. The remote tiers are
-capacity, not guarantees — see [Known limitations](#known-limitations).
+The router removes that single point of failure. Point the client at the router, and put as many
+providers behind it as you like: hosted APIs, several keys for one API, bridges, local lanes. A
+provider that errors, times out, returns no content, or stops at the token limit is a failed
+attempt, and the next one answers. Every request is bounded before any provider sees it.
 
 Routing belongs here rather than in claude-mem: upstream reviewed a provider chain, declined
 it as premature, and shipped OpenRouter-only model fallback that stops at the OpenRouter
 boundary. See [the upstream research](docs/researches/2026-09-15-claude-mem-provider-fallback-upstream.md).
 
-## Chain
+## Build your chain
 
-The chain is an ordered list of **provider instances** defined in a TOML file (see
-[Configuration](#configuration)). Each instance has one of three types, and several instances
-may share a type — two Gemini keys, say, each with its own breaker and quota block:
+Everything about the chain lives in one TOML file (see [Configuration](#configuration) for every
+field):
 
-| Type | Upstream | Default budget to first content | Notes |
+- **Providers.** Each `[providers.<name>]` table is one instance: a type, a model, where its key
+  lives, and how long it may take. Define as many as you want, several of one type included —
+  three Gemini keys are three instances, each with its own breaker and quota block.
+- **Order.** `chain` lists provider names in the order they are tried. Reorder it, drop an
+  entry, or add one; nothing else changes. `OBSERVER_ROUTER_CHAIN` overrides it for one run
+  without editing the file.
+- **Groups.** A chain entry may name a `[groups.<name>]` of providers instead. A group rotates:
+  each request starts at the next member and the rest follow, so load spreads across several keys
+  and a blocked member still falls over to its siblings before the chain moves on.
+- **Per-provider behaviour.** Budgets, request fields (`reasoning_effort`,
+  `chat_template_kwargs`), stream buffering, and the GPU-lane gates (`serial`, `ac_only`,
+  `idle_metrics`) are set per instance, so one chain can mix fast hosted tiers with a slow local
+  lane.
+- **Router-wide policy.** Breaker thresholds, the prompt guard, and sampling intervals are
+  environment variables with defaults; see the table under [Configuration](#configuration).
+
+Three provider types cover the upstreams:
+
+| Type | Upstream | Default budget | What the type adds |
 | --- | --- | ---: | --- |
-| `gemini` | `generativelanguage.googleapis.com/v1beta/openai` | 18 s | Daily-quota 429s block the instance until midnight Pacific |
-| `openrouter` | `openrouter.ai/api/v1` | 24 s | Reasoning disabled per request; `X-RateLimit-Reset` blocks the instance |
-| `openai` | any OpenAI-compatible `url` | 40 s | Local lanes and bridges; key optional; the GPU-lane gates live here |
+| `gemini` | `generativelanguage.googleapis.com/v1beta/openai` | 18 s | Reads Gemini's quota errors and blocks a key until its quota resets |
+| `openrouter` | `openrouter.ai/api/v1` | 24 s | Disables reasoning per request; reads `X-RateLimit-Reset`; attribution headers |
+| `openai` | any OpenAI-compatible `url` | 40 s | Local lanes and bridges; key optional; the GPU-lane gates and request fields |
 
-A chain entry may also name a **group** of providers. A group rotates: each request starts at the
-next member in turn and the remaining members follow, so load spreads evenly across several keys,
-and a failing or quota-blocked member still falls over to the others before the chain moves on.
-Mix the two freely — a rotating pool of keys first, then plain fallbacks.
+For example, a pool of keys first, then a paid fallback, then a local lane as the backstop:
 
-The reference deployment runs `gemini` (`gemini-flash-lite-latest`) → `openrouter`
-(`openrouter/free`) → `cursor` (`composer-2.5` through a [cursor-api-proxy] bridge on `:8765`, 40
-s) → `local` (an MLX/Splash lane, 70 s). Keep the budgets' sum under the client's per-request
-timeout. For claude-mem (15.2.1) that is `CLAUDE_MEM_LLM_TIMEOUT_MS`, the per-attempt deadline of
-an observer call: 180 s by default, at most 300 s. A streamed call is bound tighter by
-`CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS`, 90 s by default, which runs from the moment the request
-is sent until the response headers arrive, and again between reads. The router withholds its
-headers until it commits, so every attempt before the one that answers counts against those 90 s:
-an answer that comes later than that reaches no one.
-`CLAUDE_MEM_API_TIMEOUT_MS` is unrelated; it bounds calls to claude-mem's own worker API.
-claude-mem asks for `max_tokens` 4096 (`CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS`) at temperature
-0.3, and the router forwards both.
+```toml
+chain = ["keys", "paid", "local"]
 
-[cursor-api-proxy]: https://github.com/anyrobert/cursor-api-proxy
+[groups.keys]
+members = ["gemini-a", "gemini-b"]
+```
+
+or a local lane first, with hosted capacity only when it is busy or down:
+
+```toml
+chain = ["local", "gemini-a", "openrouter"]
+```
+
+**Size the budgets to the client's deadline.** The router waits up to each instance's `budget_s`
+in turn, so the budgets of the instances that can fail before the one that answers add up. For
+claude-mem (15.2.1) the per-attempt deadline is `CLAUDE_MEM_LLM_TIMEOUT_MS`, 180 s by default and
+at most 300 s. A streamed call is bound tighter by `CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS`, 90 s
+by default, which runs from the moment the request is sent until the response headers arrive,
+and again between reads. The router withholds its headers until it commits, so every attempt
+before the one that answers counts against those 90 s: an answer that comes later than that
+reaches no one. `CLAUDE_MEM_API_TIMEOUT_MS` is unrelated; it bounds calls to claude-mem's own
+worker API. claude-mem asks for `max_tokens` 4096 (`CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS`) at
+temperature 0.3, and the router forwards both.
 
 ## Tier behaviour
 
@@ -187,7 +210,9 @@ one of them has been idle for `idle_seconds` (30 s). Without `idle_metrics` the 
 
 - A lane is active while `submitted − completed − cancelled − failed` is above zero, or when
   its submitted counter moved since the previous sample. The second rule catches a request that
-  started and finished between samples.
+  started and finished between samples. The counters read are Splash's
+  `splash_requests_{submitted,completed,cancelled,failed}_total`; a lane on another server
+  exposes different names and cannot be gated yet.
 - A background thread samples every `OBSERVER_IDLE_SAMPLE_SECONDS` (2 s), covering the lanes of
   every instance in the active chain. The grace period covers the pause an agent loop takes
   between requests while its tools run.
@@ -244,7 +269,7 @@ ac_only = true
 | `chat_template_kwargs` | `openai` | unset | Sent as-is, e.g. `{ enable_thinking = false }` for Qwen on mtplx or vLLM, which ignore `reasoning_effort` |
 | `serial` | `openai` | `false` | One request at a time per lane URL |
 | `ac_only` | `openai` | `false` | Skip while on battery |
-| `buffer_stream` | `openai` | `false` | Hold a stream back until it ends, so a reply cut off at the token limit fails over |
+| `buffer_stream` | all | `false` | Hold a stream back until it ends, so a reply cut off at the token limit fails over |
 | `idle_metrics`, `idle_seconds` | `openai` | none, `30` | Wait for these lanes to be idle first |
 
 `chain` lists provider or group names in order; without it the providers' order is used, and
@@ -264,10 +289,10 @@ group for the breaker interval (`OBSERVER_BREAK_SECONDS`, 60 s) and the chain mo
 instead of spending each member's budget in turn:
 
 - an HTTP 503 from any member blocks the group immediately;
-- a socket read timeout, or a 429 that names no quota, blocks it only when two members fail so in
-  a row, since one timeout is ordinary tail latency and one unexplained 429 can be one key. Any
-  member's success resets the count, and a timeout counts only when the member had its whole
-  budget, not one the request deadline had already cut short;
+- a socket read timeout, or a 429 that names no quota, blocks it only when two members
+  (`OBSERVER_GROUP_STRIKES`) fail so in a row, since one timeout is ordinary tail latency and one
+  unexplained 429 can be one key. Any member's success resets the count, and a timeout counts only
+  when the member had its whole budget, not one the request deadline had already cut short;
 - a quota 429 still blocks only the member whose key ran out.
 
 The rotation position is in memory and starts again at the first member after a restart. `/health`
@@ -280,19 +305,23 @@ Environment variables from before the config file (`OBSERVER_LOCAL_*`, `OBSERVER
 the like) are ignored, and start-up logs their names. `config.toml` and `*.env` are git-ignored
 in this repository.
 
-Environment overrides (all optional):
+Environment overrides, all optional. An unset or empty variable takes the default. A value that is
+not a number, or is out of range, stops the router at start-up with the variable named in the
+log (exit status 2), as an invalid config file does; it never falls back to the default silently.
+Integer settings stop at 1,000,000,000.
 
-| Variable | Default |
-| --- | --- |
-| `OBSERVER_ROUTER_CONFIG` | `~/.config/observer-router/config.toml` |
-| `OBSERVER_ROUTER_CHAIN` | the file's `chain` — comma-separated provider or group names, e.g. to drop a local lane during a benchmark |
-| `OBSERVER_ROUTER_HOST` / `OBSERVER_ROUTER_PORT` | `127.0.0.1` / `1244` |
-| `OBSERVER_BREAK_AFTER` / `OBSERVER_BREAK_SECONDS` | `3` / `60` |
-| `OBSERVER_POWER_CACHE_SECONDS` | `30` |
-| `OBSERVER_IDLE_SAMPLE_SECONDS` | `2` |
-| `OBSERVER_MAX_PROMPT_CHARS` / `OBSERVER_MAX_FIELD_CHARS` | `240000` / `80000` |
-| `OBSERVER_MIN_RETAINED_CHARS` | `1024` |
-| `OBSERVER_BASE64_BLOB_CHARS` | `16384` |
+| Variable | Default | Accepts |
+| --- | --- | --- |
+| `OBSERVER_ROUTER_CONFIG` | `~/.config/observer-router/config.toml` | a path |
+| `OBSERVER_ROUTER_CHAIN` | the file's `chain` | comma-separated provider or group names, e.g. to drop a local lane during a benchmark |
+| `OBSERVER_ROUTER_HOST` / `OBSERVER_ROUTER_PORT` | `127.0.0.1` / `1244` | an address / an integer 1–65535 |
+| `OBSERVER_BREAK_AFTER` / `OBSERVER_BREAK_SECONDS` | `3` / `60` | an integer ≥ 1 / seconds ≥ 1 |
+| `OBSERVER_GROUP_STRIKES` | `2` | an integer ≥ 1: group members failing in a row, by timeout or unexplained 429, that block the group |
+| `OBSERVER_POWER_CACHE_SECONDS` | `30` | seconds ≥ 0 |
+| `OBSERVER_IDLE_SAMPLE_SECONDS` | `2` | seconds, 0.1–3600 |
+| `OBSERVER_MAX_PROMPT_CHARS` / `OBSERVER_MAX_FIELD_CHARS` | `240000` / `80000` | integers ≥ 1 |
+| `OBSERVER_MIN_RETAINED_CHARS` | `1024` | an integer ≥ 0 |
+| `OBSERVER_BASE64_BLOB_CHARS` | `16384` | an integer ≥ 1 |
 
 ### Consumer contract
 
@@ -341,11 +370,11 @@ unloaded, and `KeepAlive` cannot bring back a job that is no longer registered.
 | models | `curl -fsS http://127.0.0.1:1244/v1/models` |
 
 Exercise one instance in isolation by starting a throwaway router whose chain names only it. Use
-a port nothing listens on: the ports next to 1244 belong to other local services, so check with
+a port nothing listens on: ports next to 1244 may belong to other local services, so check with
 `lsof -nP -iTCP:<port> -sTCP:LISTEN` first, and stop only the process you started.
 
 ```bash
-OBSERVER_ROUTER_PORT=12944 OBSERVER_ROUTER_CHAIN=cursor python3 observer-router.py
+OBSERVER_ROUTER_PORT=12944 OBSERVER_ROUTER_CHAIN=<provider-name> python3 observer-router.py
 # then POST to :12944 — the log shows which instance served
 ```
 
@@ -367,24 +396,21 @@ the 429 shapes Gemini and OpenRouter actually return.
 
 ## Known limitations
 
-1. **Free remote quotas are too small for daily observer volume.** Both remote tiers have hard
-   daily caps, so after they expire the local lane is the only instance left unless another
-   instance (a second key, or a bridge) is configured.
-2. **A hung-but-alive local lane still defeats launchd `KeepAlive`.** The prompt guard blocks
-   the oversized-prompt trigger, but an unrelated MLX generation-thread failure would still
-   need `launchctl kickstart -k`. Router-triggered restart is unimplemented.
-3. **The byte cache cap is not enforced in mlx_lm's streaming insertion path.** Sequence count
-   is the effective production bound on the local lane.
-4. **Cosmetic log noise.** claude-mem client disconnects raise `BrokenPipeError` and
+1. **Free hosted quotas run out.** Free Gemini and OpenRouter keys have hard daily caps, so a
+   chain of free tiers alone goes dark for the rest of the day; end it with an instance that has
+   no such cap (a local lane, a paid key, or a bridge).
+2. **A hung-but-alive local lane still defeats launchd `KeepAlive`.** The router fails over
+   around it, but cannot restart it; that still needs `launchctl kickstart -k` on the lane's job.
+3. **Cosmetic log noise.** claude-mem client disconnects raise `BrokenPipeError` and
    `ConnectionResetError` tracebacks in the router log. They are harmless but loud.
-5. **A buffered instance answers only when its reply is whole.** Under load, the wait for a
+4. **A buffered instance answers only when its reply is whole.** Under load, the wait for a
    `serial` lane plus a whole reply can pass claude-mem's 90 s stream idle timeout, which a
    streamed first token would have reset. Sending headers and keep-alive comments early would
    avoid it, at the cost of the failed-chain 502.
-6. **Unbuffered tiers still forward a cut-off reply.** Hosted tiers that hit claude-mem's
+5. **Unbuffered tiers still forward a cut-off reply.** Hosted tiers that hit claude-mem's
    `max_tokens` (seen while a model echoes the file it observes) cannot fail over; the reply is
    logged, ends with `finish_reason: length`, and claude-mem keeps its complete blocks.
-7. **Breakers and quota blocks live in memory.** A restart forgets them, so the first requests
+6. **Breakers and quota blocks live in memory.** A restart forgets them, so the first requests
    after one meet each exhausted quota again before it is blocked anew.
 
 ## Documentation

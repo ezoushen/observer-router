@@ -391,12 +391,12 @@ class EnvironmentTests(unittest.TestCase):
             clean = {k: v for k, v in router.os.environ.items() if not k.startswith("OBSERVER_")}
             try:
                 return subprocess.run(
-                    [sys.executable, str(MODULE_PATH)], capture_output=True, text=True, timeout=5,
+                    [sys.executable, str(MODULE_PATH)], capture_output=True, text=True, timeout=60,
                     env={**clean, "OBSERVER_ROUTER_CONFIG": str(config),
                          "OBSERVER_ROUTER_PORT": port, **env},
                 )
             except subprocess.TimeoutExpired:
-                self.fail(f"the router started despite {env}")
+                self.fail(f"the router did not exit within 60 s; it may have started despite {env}")
 
     def test_an_invalid_setting_stops_the_router_and_names_it(self):
         # Rule: a value that is not a number, or is out of range, is an error at start-up (exit

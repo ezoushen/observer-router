@@ -4,6 +4,41 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-26 — unexplained 429s block a group
+
+### Changed
+
+- **A 429 that names no quota counts as an overloaded model in a group.** Two members in a row
+  that get Gemini's bare `RESOURCE_EXHAUSTED` skip every member for the breaker interval, as two
+  full-budget timeouts already did. Between 2026-10-21 and 2026-10-26 that 429 was 1,686 of
+  Gemini's 1,757 429s and, in 155 of the 262 minutes it occurred, reached all five keys. A 429
+  that names its quota still blocks only its own key, until the stated reset.
+
+## 2026-10-26 — replies cut off at the token limit
+
+### Added
+
+- **`buffer_stream`** on `openai` providers holds a stream back until it ends, so a reply cut off
+  at the token limit can still fail over. It costs first-byte latency, so it suits a small local
+  model with a hard output cap.
+- **A cut-off reply is logged** with its prompt and completion size and its first and last 80
+  characters, to tell a looping model from a genuinely long answer.
+- **A `buffer_stream` instance's budget covers its whole reply**, as a hard bound on every read, so
+  a lane still generating when the budget runs out fails over instead of holding a `serial` lane
+  for a client that left.
+- **A cut-off reply is served when no later tier answers**, with `finish_reason: length`, since
+  claude-mem stores the complete blocks of a cut-off reply; a 502 would lose them all.
+
+### Fixed
+
+- **The README's throwaway-router example** used port 1247, which another local service listens
+  on; it now uses 12944 and says to check the port first.
+- **A reply that ends `finish_reason: length` is no longer served as a success.** Non-streaming,
+  and from a `buffer_stream` instance, the next tier answers; an unbuffered stream that was
+  already forwarded is logged, ends with a `finish_reason: length` frame, and is not recorded as
+  served. A cut-off does not count toward the breaker: it depends on the prompt, not on the
+  provider's health.
+
 ## 2026-09-30 — group-wide overload block
 
 ### Added

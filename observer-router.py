@@ -362,7 +362,7 @@ _TYPE_FIELDS = {
     "openrouter": {"site_url": "str", "app_name": "str"},
     # The GPU-lane gates only make sense for a lane on this machine, so only openai has them.
     "openai": {"reasoning_effort": "str", "chat_template_kwargs": "table",
-               "serial": "bool", "ac_only": "bool",
+               "serial": "bool", "ac_only": "bool", "buffer_stream": "bool",
                "idle_metrics": "urls", "idle_seconds": "seconds"},
 }
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -390,6 +390,7 @@ class Provider:
     chat_template_kwargs: dict | None = None
     serial: bool = False
     ac_only: bool = False
+    buffer_stream: bool = False
     idle_metrics: tuple[str, ...] = ()
     idle_seconds: float = 30.0
 
@@ -588,7 +589,7 @@ def configure(config: Config, chain: tuple[str, ...] | None = None) -> None:
     with _rotation_lock:
         _rotation.clear()
     with _breaker_lock:
-        _group_timeouts.clear()
+        _group_strikes.clear()
 
 
 def chain_providers() -> list[str]:
@@ -811,7 +812,7 @@ def tier_ok(name: str) -> None:
     group = _group_of(name)
     with _breaker_lock:
         if group:
-            _group_timeouts[group] = 0
+            _group_strikes[group] = 0
         _failures[name] = 0
         _skip_until[name] = 0.0
         _skip_reason[name] = ""
@@ -956,13 +957,17 @@ class TierFailure(Exception):
     """
 
     def __init__(self, message: str, retry_at: float | None = None, quota: str = "",
-                 overloaded: str = ""):
+                 overloaded: str = "", partial: tuple[str, str] | None = None):
         super().__init__(message)
         self.retry_at = retry_at
         self.quota = quota
-        # Why the model itself, not this key, looks out of capacity: "unavailable" (HTTP 503) or
-        # "timeout" (a socket read timeout that used the provider's whole budget). Every key in
-        # the provider's group would fail the same way. Empty otherwise.
+        # (served model, text) of a reply cut off at the token limit: served when no later tier
+        # answers, since claude-mem keeps a cut-off reply's complete blocks.
+        self.partial = partial
+        # Why the model itself, not this key, looks out of capacity: "unavailable" (HTTP 503),
+        # "exhausted" (an HTTP 429 that names no quota), or "timeout" (a socket read timeout that
+        # used the provider's whole budget). Every key in the provider's group would fail the
+        # same way. Empty otherwise.
         self.overloaded = overloaded
 
 
@@ -1070,9 +1075,10 @@ def headers_for(provider: Provider) -> dict:
 class UpstreamResponse:
     """File-like wrapper that closes both the response and its connection."""
 
-    def __init__(self, connection, response):
+    def __init__(self, connection, response, sock=None):
         self._connection = connection
         self._response = response
+        self._sock = sock
 
     def read(self, size: int | None = None):
         if size is None:
@@ -1081,6 +1087,11 @@ class UpstreamResponse:
 
     def __iter__(self):
         return iter(self._response)
+
+    def set_timeout(self, seconds: float) -> None:
+        """Bound the next reads; the socket keeps this until it is set again."""
+        if self._sock is not None:
+            self._sock.settimeout(seconds)
 
     def close(self) -> None:
         try:
@@ -1116,6 +1127,7 @@ def _open(provider: Provider, body: dict, timeout: float, reasoning_mode: str | 
     connection = _connect(provider, timeout)
     try:
         connection.request("POST", parts.path or "/", body=payload, headers=headers)
+        sock = connection.sock  # getresponse drops it from a connection that will close
         response = connection.getresponse()
     except Exception as error:
         connection.close()
@@ -1136,7 +1148,7 @@ def _open(provider: Provider, body: dict, timeout: float, reasoning_mode: str | 
         )
         error.body_text = detail
         raise error
-    return UpstreamResponse(connection, response)
+    return UpstreamResponse(connection, response, sock)
 
 
 def _error_body(error: HTTPError) -> str:
@@ -1163,7 +1175,10 @@ def _http_failure(provider: Provider, error: HTTPError) -> TierFailure:
         return TierFailure(
             f"{name}: HTTP {error.code}: quota {quota_name} exhausted", retry_at, quota_name
         )
-    return TierFailure(f"{name}: HTTP {error.code}: {_snippet(error)}", overloaded="unavailable" if error.code == 503 else "")
+    # A 429 that names no quota (Gemini's bare RESOURCE_EXHAUSTED) has no reset to wait for, and
+    # has been seen on every key of a group within the same minute: shared model capacity.
+    overloaded = {503: "unavailable", 429: "exhausted"}.get(error.code, "")
+    return TierFailure(f"{name}: HTTP {error.code}: {_snippet(error)}", overloaded=overloaded)
 
 
 def _is_mandatory_reasoning_error(error: HTTPError) -> bool:
@@ -1213,7 +1228,10 @@ def iter_stream(provider: Provider, body: dict, deadline: float):
     """Yield ('meta', served_model) once, then ('delta', text) frames.
 
     Raises TierFailure when the provider produces no content or errors before the first
-    content delta, so the caller can still fall through to the next provider.
+    content delta, so the caller can still fall through to the next provider. A buffer_stream
+    provider yields nothing until its stream ends, so a reply cut off at the token limit
+    (finish_reason=length) fails over too; any other provider's cut-off reply raises only after
+    its text was forwarded.
     """
     with lane_guard(provider):
         yield from _iter_stream_locked(provider, body, deadline, _reasoning_mode(provider))
@@ -1221,12 +1239,30 @@ def iter_stream(provider: Provider, body: dict, deadline: float):
 
 def _iter_stream_locked(provider, body, deadline, reasoning_mode):
     timeout = _budget_left(provider.budget, deadline)
+    # A buffered reply reaches the client only once it is whole, so the budget to first content
+    # covers all of it: each read may wait only for what is left of it.
+    whole_by = time.time() + timeout
     response = _open_with_reasoning_retry(provider, body, timeout, reasoning_mode)
 
     served = None
-    saw_content = False
+    finish = None
+    usage = {}
+    pieces: list[str] = []
+    committed = False
+
+    def bound_next_read():
+        left = whole_by - time.time()
+        if left <= 0:
+            raise TierFailure(f"{provider.name}: reply not finished within {timeout:.0f}s",
+                              overloaded=_timeout_kind(provider, TimeoutError(), timeout))
+        response.set_timeout(left)
+
     try:
-        for raw in _lines_until_content(provider, response, timeout, lambda: saw_content):
+        if provider.buffer_stream:
+            bound_next_read()
+        for raw in _lines_until_content(provider, response, timeout, lambda: committed):
+            if provider.buffer_stream:
+                bound_next_read()
             line = raw.decode("utf-8", "ignore").strip()
             if not line.startswith("data: "):
                 continue
@@ -1238,22 +1274,34 @@ def _iter_stream_locked(provider, body, deadline, reasoning_mode):
             except ValueError:
                 continue
             served = served or chunk.get("model")
-            delta = ((chunk.get("choices") or [{}])[0].get("delta")) or {}
-            piece = delta.get("content")
+            usage = chunk.get("usage") or usage
+            choice = (chunk.get("choices") or [{}])[0]
+            finish = choice.get("finish_reason") or finish
+            piece = (choice.get("delta") or {}).get("content")
             if not piece:
                 continue  # reasoning deltas are intentionally dropped
-            if not saw_content:
-                saw_content = True
+            pieces.append(piece)
+            if provider.buffer_stream:
+                continue  # held back until finish_reason says whether the reply is whole
+            if not committed:
+                committed = True
                 yield ("meta", served or provider.model)
             yield ("delta", piece)
     finally:
         response.close()
-    if not saw_content:
+    if not pieces:
         raise TierFailure(f"{provider.name}: stream produced no content")
+    if finish == "length":
+        raise _cut_off(provider, body, "".join(pieces), usage, served or provider.model)
+    if not committed and not finish:
+        raise TierFailure(f"{provider.name}: stream ended without a finish_reason")
+    if not committed:
+        yield ("meta", served or provider.model)
+        yield ("delta", "".join(pieces))
 
 
 def _lines_until_content(provider: Provider, response, timeout: float, committed):
-    """Yield the response's lines. A read error before the first content delta -- an upstream that
+    """Yield the response's lines. A read error before the stream commits -- an upstream that
     sent its headers and then stalled -- becomes a TierFailure, so the chain can still fail over;
     after it, the error propagates to the committed stream's handler."""
     lines = iter(response)
@@ -1292,10 +1340,35 @@ def nonstream(provider: Provider, body: dict, deadline: float):
         raise TierFailure(
             f"{provider.name}: empty content (finish_reason={choice.get('finish_reason')})"
         )
+    if choice.get("finish_reason") == "length":
+        raise _cut_off(provider, body, content, payload.get("usage") or {},
+                       payload.get("model") or provider.model)
     return payload, content
 
 
+CUT_OFF_PREVIEW_CHARS = 80
+
+
+def _cut_off(provider: Provider, body: dict, text: str, usage: dict, model: str) -> TierFailure:
+    """Log a reply that hit the token limit, then return its failure.
+
+    The head and tail are logged because no body is kept anywhere else: they are what tells a
+    model stuck in a loop from a genuinely long answer.
+    """
+    usage = usage if isinstance(usage, dict) else {}
+    log(
+        f"tier {provider.name} cut off at the token limit: "
+        f"prompt_tokens={usage.get('prompt_tokens', '?')} "
+        f"prompt_chars={_message_chars(body.get('messages') or [])} "
+        f"completion_tokens={usage.get('completion_tokens', '?')} chars={len(text)} "
+        f"head={text[:CUT_OFF_PREVIEW_CHARS]!r} tail={text[-CUT_OFF_PREVIEW_CHARS:]!r}"
+    )
+    return TierFailure(f"{provider.name}: reply cut off at the token limit", partial=(model, text))
+
+
 def record_failure(tier: str, failure: TierFailure) -> None:
+    if failure.partial:
+        return  # a cut-off depends on the prompt, not on the provider's health
     if failure.retry_at:
         tier_quota_exhausted(tier, failure.retry_at, failure.quota)
         return
@@ -1303,20 +1376,22 @@ def record_failure(tier: str, failure: TierFailure) -> None:
     group = _group_of(tier)
     if group is None or not failure.overloaded:
         return
-    if failure.overloaded == "timeout":
-        # One timeout is ordinary tail latency (a budget sits near the p99); two members timing
-        # out in a row, with no success between, is the model.
+    if failure.overloaded in ("timeout", "exhausted"):
+        # One timeout is ordinary tail latency (a budget sits near the p99), and one unexplained
+        # 429 can be one key; two members failing so in a row, with no success between, is the
+        # model.
         with _breaker_lock:
-            _group_timeouts[group] = _group_timeouts.get(group, 0) + 1
-            if _group_timeouts[group] < GROUP_TIMEOUTS_TO_BLOCK:
+            _group_strikes[group] = _group_strikes.get(group, 0) + 1
+            if _group_strikes[group] < GROUP_STRIKES_TO_BLOCK:
                 return
-            _group_timeouts[group] = 0
+            _group_strikes[group] = 0
     group_overloaded(group, str(failure))
 
 
-# Consecutive member timeouts, per group, that block the group; any member's success resets it.
-GROUP_TIMEOUTS_TO_BLOCK = 2
-_group_timeouts: dict[str, int] = {}
+# Consecutive member timeouts or unexplained 429s, per group, that block the group; any member's
+# success resets it.
+GROUP_STRIKES_TO_BLOCK = 2
+_group_strikes: dict[str, int] = {}
 
 
 def _group_of(tier: str) -> str | None:
@@ -1366,13 +1441,14 @@ class RouterHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
 
     @staticmethod
-    def _sse_delta(model: str, text: str) -> str:
+    def _sse_delta(model: str, text: str, finish_reason: str | None = None) -> str:
         chunk = {
             "id": "chatcmpl-router",
             "object": "chat.completion.chunk",
             "created": _now(),
             "model": model,
-            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+            "choices": [{"index": 0, "delta": {"content": text} if text else {},
+                         "finish_reason": finish_reason}],
         }
         return f"data: {json.dumps(chunk)}\n\n"
 
@@ -1443,6 +1519,7 @@ class RouterHandler(BaseHTTPRequestHandler):
 
     def _stream(self, body: dict, order: list[str], deadline: float) -> None:
         attempted = []
+        salvage = None  # (tier, (model, text)) of the first reply cut off at the token limit
         allowed, skipped = allowed_tiers(order)
         for tier, reason in skipped.items():
             attempted.append(f"{tier}({reason})")
@@ -1467,6 +1544,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 record_failure(tier, failure)
                 attempted.append(f"{tier}({failure})")
                 log(f"tier {tier} failed: {failure}")
+                salvage = salvage or (failure.partial and (tier, failure.partial))
                 continue
 
             # First content delta is in hand: commit to this tier and stop buffering.
@@ -1487,20 +1565,41 @@ class RouterHandler(BaseHTTPRequestHandler):
                 )
             except Exception as error:  # mid-stream failure: the connection is committed
                 log(f"tier {tier} failed mid-stream: {type(error).__name__}: {error}")
-                tier_failed(tier, f"mid-stream {type(error).__name__}")
+                cut_off = bool(getattr(error, "partial", None))
+                if not cut_off:
+                    tier_failed(tier, f"mid-stream {type(error).__name__}")
                 try:
+                    if cut_off:  # tell the client, which keeps a cut-off reply's complete blocks
+                        self._chunk(self._sse_delta(served, "", "length"))
                     self._chunk("data: [DONE]\n\n")
                     self._end_chunks()
                 except Exception as error:
                     log(f"failed to close stream for tier {tier}: {type(error).__name__}")
             return
 
+        if salvage:
+            tier, (served, text) = salvage
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                self._chunk(self._sse_delta(served, text))
+                self._chunk(self._sse_delta(served, "", "length"))
+                self._chunk("data: [DONE]\n\n")
+                self._end_chunks()
+                log(f"served tier={tier} model={served} cut off, no later tier answered stream=1")
+            except Exception as error:
+                log(f"failed to send the cut-off reply of tier {tier}: {type(error).__name__}")
+            return
         self._json(502, {"error": "all tiers failed", "attempted": attempted})
 
     # --- non-streaming path ---------------------------------------------------
 
     def _once(self, body: dict, order: list[str], deadline: float) -> None:
         attempted = []
+        salvage = None  # (tier, (model, text)) of the first reply cut off at the token limit
         allowed, skipped = allowed_tiers(order)
         for tier, reason in skipped.items():
             attempted.append(f"{tier}({reason})")
@@ -1519,6 +1618,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 record_failure(tier, failure)
                 attempted.append(f"{tier}({failure})")
                 log(f"tier {tier} failed: {failure}")
+                salvage = salvage or (failure.partial and (tier, failure.partial))
                 continue
             served = payload.get("model") or tier
             choice = (payload.get("choices") or [{}])[0]
@@ -1538,6 +1638,22 @@ class RouterHandler(BaseHTTPRequestHandler):
                     "finish_reason": choice.get("finish_reason") or "stop",
                 }],
                 "usage": payload.get("usage") or {},
+            })
+            return
+        if salvage:
+            tier, (served, text) = salvage
+            log(f"served tier={tier} model={served} cut off, no later tier answered stream=0")
+            self._json(200, {
+                "id": "chatcmpl-router",
+                "object": "chat.completion",
+                "created": _now(),
+                "model": served,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "length",
+                }],
+                "usage": {},
             })
             return
         self._json(502, {"error": "all tiers failed", "attempted": attempted})

@@ -73,6 +73,10 @@ reasoning_effort = "none"   # sent as-is; omit for servers that reject unknown f
 # chat_template_kwargs = { enable_thinking = false }   # Qwen on mtplx/vLLM, which ignore the above
 serial = true               # one request at a time per lane URL
 ac_only = true              # skipped while a laptop runs on battery
+# buffer_stream = true      # hold a stream until it ends; a reply cut off at the token limit
+                            # then fails over, at the cost of sending nothing until it is whole.
+                            # budget_s then bounds the whole reply: keep it under the client's
+                            # stream idle timeout (claude-mem: 90 s)
 # Wait until these interactive lanes' Prometheus /metrics (Splash counters) have been idle for
 # idle_seconds before using this lane.
 # idle_metrics = ["http://127.0.0.1:1241/metrics"]

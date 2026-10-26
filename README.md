@@ -41,11 +41,15 @@ Mix the two freely — a rotating pool of keys first, then plain fallbacks.
 The reference deployment runs `gemini` (`gemini-flash-lite-latest`) → `openrouter`
 (`openrouter/free`) → `cursor` (`composer-2.5` through a [cursor-api-proxy] bridge on `:8765`, 40
 s) → `local` (an MLX/Splash lane, 70 s). Keep the budgets' sum under the client's per-request
-timeout. For claude-mem (13.28) that is `CLAUDE_MEM_LLM_TIMEOUT_MS`, the per-attempt deadline of
-an observer call: 30 s by default, at most 300 s. `CLAUDE_MEM_API_TIMEOUT_MS` is unrelated; it
-bounds calls to claude-mem's own worker API. The four-instance chain sums to 152 s, so with the
-default a slow chain is cut off after 30 s and the later instances never answer; set
-`CLAUDE_MEM_LLM_TIMEOUT_MS` to at least 160000 for that chain.
+timeout. For claude-mem (15.2.1) that is `CLAUDE_MEM_LLM_TIMEOUT_MS`, the per-attempt deadline of
+an observer call: 180 s by default, at most 300 s. A streamed call is bound tighter by
+`CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS`, 90 s by default, which runs from the moment the request
+is sent until the response headers arrive, and again between reads. The router withholds its
+headers until it commits, so every attempt before the one that answers counts against those 90 s:
+an answer that comes later than that reaches no one.
+`CLAUDE_MEM_API_TIMEOUT_MS` is unrelated; it bounds calls to claude-mem's own worker API.
+claude-mem asks for `max_tokens` 4096 (`CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS`) at temperature
+0.3, and the router forwards both.
 
 [cursor-api-proxy]: https://github.com/anyrobert/cursor-api-proxy
 
@@ -60,6 +64,19 @@ default a slow chain is cut off after 30 s and the later instances never answer;
   retries the same tier once with `{"reasoning":{"exclude":true}}`.
 - **A tier with no content is a failure, not a result.** Streaming or not, an empty answer
   falls through to the next tier, so claude-mem never records an empty observation.
+- **A reply cut off at the token limit is a failure too.** `finish_reason: length` means the text
+  stopped mid-thought, or a model looped until its cap. Non-streaming, the next tier answers. A
+  stream can only fail over from an instance with `buffer_stream = true` (see the streaming
+  contract). When no later tier answers, the first cut-off reply is served after all, with
+  `finish_reason: length`: claude-mem keeps the complete blocks of a cut-off reply, so part of an
+  answer beats a 502. Either way one log line, `tier <name> cut off at the token limit: ...`,
+  records `prompt_tokens`, `prompt_chars`, `completion_tokens`, and the first and last 80
+  characters, so a loop can be told from a genuinely long answer; those characters are model
+  output, kept in the service log. A cut-off depends on the prompt, not the provider's health, so
+  it does not count toward the breaker: a prompt that makes a model loop costs that tier's attempt
+  each time it is sent, but cannot block the tier for other prompts. An unbuffered stream that was
+  cut off ends with a `finish_reason: length` frame, so the client knows. Raising the server's
+  token cap is not the fix: a loop only runs longer.
 - **Reasoning deltas are dropped.** Only `delta.content` is forwarded downstream.
 - **A bridge instance authenticates to the bridge, not to the service behind it.** Point its
   `api_key_file` at the bridge's own env file (for cursor-api-proxy, `CURSOR_BRIDGE_API_KEY`), so
@@ -76,6 +93,18 @@ that keeps failover possible right up to the moment the stream commits. An upstr
 own headers and then stalls past its budget is a failed attempt, like one that never answers.
 Once committed, a mid-stream failure cannot switch tiers — it is logged and the stream is closed
 with `data: [DONE]`.
+
+An instance with `buffer_stream = true` commits only when its upstream stream has ended. Its text
+is held back until `finish_reason` shows the reply is whole, so a reply cut off at the token
+limit, a stream that ends without a `finish_reason`, a read error at any point, or a reply still
+unfinished when its `budget_s` runs out, still fails over. The budget is a hard bound on the whole
+reply, from the moment the request is sent, so it also frees a `serial` lane that would otherwise
+keep generating for a client that has given up; size it from that client's 90 s idle timeout, not
+from prefill time alone. The cost is latency: claude-mem receives its first byte only once the
+whole reply is generated, and that must happen inside its 90 s stream idle timeout. Turn it on for
+a small local model with a hard output cap, where a cut-off is common and a full reply takes
+seconds; leave it off for fast hosted tiers. Without it, a cut-off stream has already been
+forwarded: it is logged and ends with `finish_reason: length`, and is never recorded as served.
 
 ## Prompt safety and context folding
 
@@ -116,6 +145,12 @@ A 429 that states when its quota resets skips the instance until then instead:
 - A reset that is unreadable, already past, or more than 26 hours out falls back to the
   ordinary breaker, so a malformed header cannot take a tier offline for days.
 - A shorter breaker skip never cuts a quota block short, and the next success clears it.
+- A 429 that states no reset gets the ordinary breaker. Gemini's bare `RESOURCE_EXHAUSTED`
+  ("Resource has been exhausted (e.g. check quota).") is this kind; it has been seen on every key
+  of a group within the same minute, so in a group it is treated as an overloaded model (below).
+  So is OpenRouter's "temporarily rate-limited upstream", which names the free model behind
+  `openrouter/free`, not this key. The Cursor bridge answers 429 only for its own cap on parked
+  tool sessions, and has not been seen to.
 
 The block is logged once with its reset time, named in the failed-chain `attempted` array, and
 reported in `/health` as `breaker.<name>.reason`.
@@ -201,7 +236,7 @@ ac_only = true
 | `type` | all | required | `gemini`, `openrouter`, or `openai` |
 | `model` | all | required | Model id sent upstream; for a local server, the id it advertises at `/v1/models` |
 | `url` | all | per type; required for `openai` | Chat-completions URL, `http` or `https` |
-| `budget_s` | all | 18 / 24 / 40 | Seconds allowed to reach the first content delta |
+| `budget_s` | all | 18 / 24 / 40 | Seconds allowed to reach the first content delta; with `buffer_stream`, to finish the whole reply |
 | `api_key_env` | all | none | Environment variable holding the key; checked first |
 | `api_key_file`, `api_key_var` | all | none | A dotenv file (`NAME=value`), or a JSON object when the path ends `.json`, and the key's name in it; re-read on every request |
 | `site_url`, `app_name` | `openrouter` | empty, `observer-router` | `HTTP-Referer` and `X-Title` attribution |
@@ -209,6 +244,7 @@ ac_only = true
 | `chat_template_kwargs` | `openai` | unset | Sent as-is, e.g. `{ enable_thinking = false }` for Qwen on mtplx or vLLM, which ignore `reasoning_effort` |
 | `serial` | `openai` | `false` | One request at a time per lane URL |
 | `ac_only` | `openai` | `false` | Skip while on battery |
+| `buffer_stream` | `openai` | `false` | Hold a stream back until it ends, so a reply cut off at the token limit fails over |
 | `idle_metrics`, `idle_seconds` | `openai` | none, `30` | Wait for these lanes to be idle first |
 
 `chain` lists provider or group names in order; without it the providers' order is used, and
@@ -228,9 +264,10 @@ group for the breaker interval (`OBSERVER_BREAK_SECONDS`, 60 s) and the chain mo
 instead of spending each member's budget in turn:
 
 - an HTTP 503 from any member blocks the group immediately;
-- a socket read timeout blocks it only when two members time out in a row, since one timeout is
-  ordinary tail latency. Any member's success resets the count, and a timeout counts only when the
-  member had its whole budget, not one the request deadline had already cut short;
+- a socket read timeout, or a 429 that names no quota, blocks it only when two members fail so in
+  a row, since one timeout is ordinary tail latency and one unexplained 429 can be one key. Any
+  member's success resets the count, and a timeout counts only when the member had its whole
+  budget, not one the request deadline had already cut short;
 - a quota 429 still blocks only the member whose key ran out.
 
 The rotation position is in memory and starts again at the first member after a restart. `/health`
@@ -303,11 +340,13 @@ unloaded, and `KeepAlive` cannot bring back a job that is no longer registered.
 | health | `curl -fsS http://127.0.0.1:1244/health` — chain, groups, instances, breaker and quota blocks, prompt guard, power/AC gate, idle gate |
 | models | `curl -fsS http://127.0.0.1:1244/v1/models` |
 
-Exercise one instance in isolation by starting a throwaway router whose chain names only it:
+Exercise one instance in isolation by starting a throwaway router whose chain names only it. Use
+a port nothing listens on: the ports next to 1244 belong to other local services, so check with
+`lsof -nP -iTCP:<port> -sTCP:LISTEN` first, and stop only the process you started.
 
 ```bash
-OBSERVER_ROUTER_PORT=1247 OBSERVER_ROUTER_CHAIN=cursor python3 observer-router.py
-# then POST to :1247 — the log shows which instance served
+OBSERVER_ROUTER_PORT=12944 OBSERVER_ROUTER_CHAIN=cursor python3 observer-router.py
+# then POST to :12944 — the log shows which instance served
 ```
 
 ## Tests
@@ -321,9 +360,10 @@ rotation, the chain and its override, and rejection of inline keys, unknown fiel
 names, and providers reachable twice), per-instance
 request building (key sources, attribution headers, reasoning fields, lane locks), failover
 between two instances of one type and rotation across a group's members, through the real HTTP
-handler against fake upstreams, prompt
-compaction, the power and idle gates, and quota-reset parsing against the 429 shapes Gemini and
-OpenRouter actually return.
+handler against fake upstreams, replies cut off at the token limit (failover, buffered streams and
+their whole-reply budget, the last-resort cut-off reply, the log line), group-wide blocks for
+overloaded models, prompt compaction, the power and idle gates, and quota-reset parsing against
+the 429 shapes Gemini and OpenRouter actually return.
 
 ## Known limitations
 
@@ -337,6 +377,15 @@ OpenRouter actually return.
    is the effective production bound on the local lane.
 4. **Cosmetic log noise.** claude-mem client disconnects raise `BrokenPipeError` and
    `ConnectionResetError` tracebacks in the router log. They are harmless but loud.
+5. **A buffered instance answers only when its reply is whole.** Under load, the wait for a
+   `serial` lane plus a whole reply can pass claude-mem's 90 s stream idle timeout, which a
+   streamed first token would have reset. Sending headers and keep-alive comments early would
+   avoid it, at the cost of the failed-chain 502.
+6. **Unbuffered tiers still forward a cut-off reply.** Hosted tiers that hit claude-mem's
+   `max_tokens` (seen while a model echoes the file it observes) cannot fail over; the reply is
+   logged, ends with `finish_reason: length`, and claude-mem keeps its complete blocks.
+7. **Breakers and quota blocks live in memory.** A restart forgets them, so the first requests
+   after one meet each exhausted quota again before it is blocked anew.
 
 ## Documentation
 

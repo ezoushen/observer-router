@@ -2,7 +2,9 @@
 """Contract tests for observer-router: prompt compaction, the power and idle gates, the cursor
 tier, and quota-reset blocks."""
 
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -792,10 +794,14 @@ class IdleGateTests(ActiveConfigTestCase):
 class FakeUpstream:
     """An OpenAI-compatible upstream that answers every POST with one scripted reply."""
 
-    def __init__(self, status=200, body=None, stream_pieces=None, delay=0.0, stall=0.0, script=()):
+    def __init__(self, status=200, body=None, stream_pieces=None, delay=0.0, stall=0.0, script=(),
+                 finish=None, pace=0.0):
         """delay holds back the whole reply; stall sends the headers, then holds back the body.
-        script lists (status, body, delay) replies for the first requests, in order."""
+        script lists (status, body, delay) replies for the first requests, in order. finish is
+        the stream's last frame before [DONE]: (finish_reason, usage). pace holds back each
+        stream frame after the first, so a stream that keeps arriving can outlast a budget."""
         self.status, self.body, self.stream_pieces = status, body, stream_pieces
+        self.finish, self.pace = finish, pace
         self.delay, self.stall, self.script = delay, stall, list(script)
         self.requests: list[tuple[dict, dict]] = []
         upstream = self
@@ -810,11 +816,16 @@ class FakeUpstream:
                 status, body, delay = (upstream.script.pop(0) if upstream.script
                                        else (upstream.status, upstream.body, upstream.delay))
                 if upstream.stream_pieces is not None and status == 200:
-                    frames = "".join(
+                    frames = [
                         f"data: {json.dumps({'model': 'fake', 'choices': [{'delta': delta}]})}\n\n"
                         for delta in upstream.stream_pieces
-                    ) + "data: [DONE]\n\n"
-                    data = frames.encode()
+                    ]
+                    if upstream.finish:
+                        reason, usage = upstream.finish
+                        frames.append("data: " + json.dumps({"model": "fake", "usage": usage, "choices": [
+                            {"delta": {}, "finish_reason": reason}]}) + "\n\n")
+                    frames.append("data: [DONE]\n\n")
+                    data = "".join(frames).encode()
                     content_type = "text/event-stream"
                 else:
                     data = json.dumps(body).encode()
@@ -827,7 +838,13 @@ class FakeUpstream:
                     self.end_headers()
                     self.wfile.flush()
                     time.sleep(upstream.stall)
-                    self.wfile.write(data)
+                    if upstream.pace and content_type == "text/event-stream":
+                        for index, frame in enumerate(frames):
+                            time.sleep(upstream.pace if index else 0)
+                            self.wfile.write(frame.encode())
+                            self.wfile.flush()
+                    else:
+                        self.wfile.write(data)
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # the router gave up on this upstream
 
@@ -957,6 +974,243 @@ class ChainTests(ActiveConfigTestCase):
         self.assertTrue(attempted[1].startswith("gemini-b("), attempted)
         self.assertIn("empty content", attempted[1])
 
+    def test_a_reply_cut_off_at_the_token_limit_fails_over(self):
+        # Rule: finish_reason=length is a truncated reply, not a result; the next tier answers.
+        cut = self._upstream(body={"model": "fake", "choices": [
+            {"message": {"content": "1 2 3 4 5 6"}, "finish_reason": "length"}]})
+        second = self._upstream(body=_completion("from b"))
+        self._two_geminis(cut, second)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "from b")
+        self.assertEqual(len(second.requests), 1)
+
+    def _buffered_then_fallback(self, first: FakeUpstream, fallback: FakeUpstream) -> None:
+        _use({
+            "lane": {"type": "openai", "url": first.url, "model": "lane", "buffer_stream": True},
+            "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"},
+        })
+
+    @staticmethod
+    def _streamed_text(raw: bytes) -> str:
+        frames = [json.loads(line[6:]) for line in raw.decode().splitlines()
+                  if line.startswith("data: {")]
+        return "".join(f["choices"][0]["delta"].get("content", "") for f in frames)
+
+    def test_a_buffered_stream_cut_off_at_the_token_limit_fails_over(self):
+        # Rule: a buffered provider's stream that ends finish_reason=length is never forwarded;
+        # the next tier answers in full.
+        cut = self._upstream(stream_pieces=[{"content": "loop "}, {"content": "loop "}],
+                             finish=("length", {"prompt_tokens": 4270, "completion_tokens": 2048}))
+        fallback = self._upstream(stream_pieces=[{"content": "fall"}, {"content": "back"}])
+        self._buffered_then_fallback(cut, fallback)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(self._streamed_text(raw), "fallback")
+        # A cut-off depends on the prompt, not the provider: it does not count toward the breaker.
+        self.assertEqual(self._get_health()["breaker"]["lane"]["failures"], 0)
+
+    def test_a_buffered_stream_that_finishes_is_served_whole(self):
+        # Rule: buffering changes when the text is sent, never what is sent.
+        lane = self._upstream(stream_pieces=[{"content": "hel"}, {"content": "lo"}],
+                              finish=("stop", {"prompt_tokens": 9, "completion_tokens": 2}))
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        self._buffered_then_fallback(lane, fallback)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(self._streamed_text(raw), "hello")
+        self.assertEqual(fallback.requests, [])
+
+    def test_a_cut_off_reply_is_logged_with_its_size_and_both_ends(self):
+        # Rule: one log line names the provider, prompt size, completion tokens and a short
+        # head/tail of the text, so looping can be told from a genuinely long answer.
+        text = "BEGIN" + "x" * 300 + "END"
+        cut = self._upstream(stream_pieces=[{"content": text}],
+                             finish=("length", {"prompt_tokens": 4270, "completion_tokens": 2048}))
+        self._buffered_then_fallback(cut, self._upstream(stream_pieces=[{"content": "ok"}]))
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        lines = [line for line in out.getvalue().splitlines() if "completion_tokens=" in line]
+        self.assertEqual(len(lines), 1, out.getvalue())
+        line = lines[0]
+        self.assertIn("tier lane cut off at the token limit", line)
+        self.assertIn("prompt_tokens=4270", line)
+        self.assertIn("prompt_chars=2", line)
+        self.assertIn("completion_tokens=2048", line)
+        self.assertIn("head='BEGINxxx", line)
+        self.assertIn("xxxEND'", line)
+        self.assertNotIn("x" * 200, line)  # a preview, not the whole reply
+
+    def test_an_unbuffered_stream_cut_off_is_still_logged_but_not_served_as_a_success(self):
+        # Rule: without buffer_stream the text is already forwarded, so the cut cannot fail over;
+        # it is still logged with its size and never recorded as a served reply. A cut-off says
+        # nothing about the provider's health, so it does not count toward the breaker.
+        cut = self._upstream(stream_pieces=[{"content": "partial"}],
+                             finish=("length", {"prompt_tokens": 7, "completion_tokens": 3}))
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        _use({"lane": {"type": "openai", "url": cut.url, "model": "lane"},
+              "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            status, raw = self._post({"messages": [{"role": "user", "content": "hi"}],
+                                      "stream": True})
+
+        self.assertEqual(self._streamed_text(raw), "partial")
+        last = [json.loads(line[6:]) for line in raw.decode().splitlines()
+                if line.startswith("data: {")][-1]
+        self.assertEqual(last["choices"][0]["finish_reason"], "length")  # so the client knows
+        self.assertIn("tier lane cut off at the token limit: prompt_tokens=7", out.getvalue())
+        self.assertNotIn("served tier=lane", out.getvalue())
+        self.assertEqual(self._get_health()["breaker"]["lane"]["failures"], 0)
+        self.assertEqual(fallback.requests, [])
+
+    def test_a_buffered_stream_that_ends_without_a_finish_reason_fails_over(self):
+        # Rule: a buffered stream is served only once finish_reason shows it is whole; a stream
+        # that ends without one (a lane that stopped mid-reply) is a failed attempt.
+        dropped = self._upstream(stream_pieces=[{"content": "half a sent"}])
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        self._buffered_then_fallback(dropped, fallback)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(self._streamed_text(raw), "fallback")
+
+    def test_a_cut_off_reply_with_malformed_usage_still_fails_over(self):
+        # Rule: whatever the upstream puts in usage, a cut-off reply is a failed attempt.
+        cut = self._upstream(body={"model": "fake", "usage": "n/a", "choices": [
+            {"message": {"content": "partial"}, "finish_reason": "length"}]})
+        second = self._upstream(body=_completion("from b"))
+        self._two_geminis(cut, second)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "from b")
+
+    def test_a_cut_off_non_streaming_reply_is_logged_with_its_size_and_both_ends(self):
+        # Rule: the cut-off log line is written on the non-streaming path too.
+        text = "BEGIN" + "y" * 300 + "END"
+        cut = self._upstream(body={"model": "fake", "usage": {"prompt_tokens": 5109,
+                                                              "completion_tokens": 2048},
+                                   "choices": [{"message": {"content": text},
+                                                "finish_reason": "length"}]})
+        self._two_geminis(cut, self._upstream(body=_completion("from b")))
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self._post({"messages": [{"role": "user", "content": "hello"}]})
+
+        lines = [line for line in out.getvalue().splitlines() if "completion_tokens=" in line]
+        self.assertEqual(len(lines), 1, out.getvalue())
+        self.assertIn("tier gemini-a cut off at the token limit: prompt_tokens=5109 "
+                      "prompt_chars=5 completion_tokens=2048 chars=308 head='BEGINyyy", lines[0])
+        self.assertIn("yyyEND'", lines[0])
+
+    def test_a_buffered_stream_must_finish_within_its_budget(self):
+        # Rule: a buffered provider's budget covers its whole reply, since nothing reaches the
+        # client before the end; a lane still generating past it fails over instead of holding
+        # the lane while the client's idle timeout runs out.
+        slow = self._upstream(stream_pieces=[{"content": "a"}, {"content": "b"}, {"content": "c"}],
+                              finish=("stop", {}), pace=0.6)
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        _use({"lane": {"type": "openai", "url": slow.url, "model": "lane", "buffer_stream": True,
+                       "budget_s": 1},
+              "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(self._streamed_text(raw), "fallback")
+
+    def test_a_cut_off_reply_is_served_when_no_later_tier_answers(self):
+        # Rule: a whole reply from a later tier wins, but a cut-off reply beats none at all:
+        # claude-mem stores its complete blocks when told finish_reason=length.
+        cut = self._upstream(body={"model": "fake", "choices": [
+            {"message": {"content": "<observation>a</observation><obs"},
+             "finish_reason": "length"}]})
+        down = self._upstream(status=503, body={"error": "down"})
+        self._two_geminis(cut, down)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(status, 200)
+        choice = json.loads(raw)["choices"][0]
+        self.assertEqual(choice["message"]["content"], "<observation>a</observation><obs")
+        self.assertEqual(choice["finish_reason"], "length")
+
+    def test_a_buffered_cut_off_stream_is_served_when_no_later_tier_answers(self):
+        # Rule: as above, on the streaming path; the last frame says finish_reason=length.
+        cut = self._upstream(stream_pieces=[{"content": "<observation>a</observation>"},
+                                            {"content": "<obs"}],
+                             finish=("length", {"prompt_tokens": 9, "completion_tokens": 2048}))
+        down = self._upstream(status=503, body={"error": "down"})
+        self._buffered_then_fallback(cut, down)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(self._streamed_text(raw), "<observation>a</observation><obs")
+        frames = [json.loads(line[6:]) for line in raw.decode().splitlines()
+                  if line.startswith("data: {")]
+        self.assertEqual(frames[-1]["choices"][0]["finish_reason"], "length")
+        self.assertTrue(raw.decode().rstrip().endswith("data: [DONE]"))
+
+    def test_a_buffered_budget_holds_even_while_each_read_beats_the_read_timeout(self):
+        # Rule: the whole-reply budget is a hard bound; a lane dribbling frames just inside the
+        # read timeout cannot hold the request past it.
+        slow = self._upstream(stream_pieces=[{"content": "a"}, {"content": "b"}, {"content": "c"}],
+                              finish=("stop", {}), pace=1.5)
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        _use({"lane": {"type": "openai", "url": slow.url, "model": "lane", "buffer_stream": True,
+                       "budget_s": 2},
+              "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
+
+        started = time.time()
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        elapsed = time.time() - started
+
+        self.assertEqual(self._streamed_text(raw), "fallback")
+        self.assertLess(elapsed, 2.7)  # budget 2 s; the next frame was due at 3 s
+
+    def test_a_buffered_budget_includes_the_wait_for_headers(self):
+        # Rule: the whole-reply budget starts when the request is sent, so time spent before the
+        # first line (a lane holding its headers through prefill) comes out of it.
+        late = self._upstream(stream_pieces=[{"content": "late"}], finish=("stop", {}),
+                              delay=0.6, stall=3.0)
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        _use({"lane": {"type": "openai", "url": late.url, "model": "lane", "buffer_stream": True,
+                       "budget_s": 1},
+              "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
+
+        started = time.time()
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+        elapsed = time.time() - started
+
+        self.assertEqual(self._streamed_text(raw), "fallback")
+        self.assertLess(elapsed, 1.4)  # budget 1 s; a fresh read timeout would end at 1.6 s
+
+    def test_an_unbuffered_stream_is_not_cut_at_its_budget_once_committed(self):
+        # Rule: the whole-reply bound applies only to buffer_stream; a committed stream that
+        # keeps arriving within the read timeout is forwarded whole.
+        slow = self._upstream(stream_pieces=[{"content": "a"}, {"content": "b"}, {"content": "c"}],
+                              finish=("stop", {}), pace=0.6)
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        _use({"lane": {"type": "openai", "url": slow.url, "model": "lane", "budget_s": 1},
+              "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertEqual(self._streamed_text(raw), "abc")
+        self.assertEqual(fallback.requests, [])
+
     def _pool(self, first: FakeUpstream, second: FakeUpstream, fallback: FakeUpstream) -> None:
         router.configure(router.parse_config({
             "chain": ["pool", "fallback"],
@@ -1046,6 +1300,36 @@ class ChainTests(ActiveConfigTestCase):
         self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "fallback")
         self.assertEqual(sibling.requests, [])
         self.assertIn("overloaded", self._get_health()["breaker"]["gemini-2"]["reason"])
+
+    # Gemini's 429 for shared model capacity: no QuotaFailure, no RetryInfo, so no reset to wait for.
+    EXHAUSTED = [{"error": {"code": 429, "message": "Resource has been exhausted (e.g. check quota).",
+                            "status": "RESOURCE_EXHAUSTED"}}]
+
+    def test_two_members_exhausted_in_a_row_block_the_group(self):
+        # Rule: a 429 that names no quota, from two members in a row, is the model out of
+        # capacity rather than one key: every member is skipped for the breaker interval.
+        exhausted = [self._upstream(status=429, body=self.EXHAUSTED) for _ in range(2)]
+        sibling = self._upstream(body=_completion("sibling"))
+        fallback = self._upstream(body=_completion("fallback"))
+        self._pool_of([*exhausted, sibling], fallback)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "fallback")
+        self.assertEqual(sibling.requests, [])
+        self.assertIn("overloaded", self._get_health()["breaker"]["gemini-2"]["reason"])
+
+    def test_one_member_exhausted_does_not_block_the_group(self):
+        # Rule: a single unexplained 429 can be one key; its siblings are still tried.
+        exhausted = self._upstream(status=429, body=self.EXHAUSTED)
+        siblings = [self._upstream(body=_completion("sibling")) for _ in range(2)]
+        fallback = self._upstream(body=_completion("fallback"))
+        self._pool_of([exhausted, *siblings], fallback)
+
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertEqual(json.loads(raw)["choices"][0]["message"]["content"], "sibling")
+        self.assertEqual(self._get_health()["breaker"]["gemini-2"]["reason"], "")
 
     def test_a_stall_after_content_is_committed_does_not_block_the_group(self):
         first = self._upstream(stream_pieces=[{"content": "hel"}], stall=0.0)

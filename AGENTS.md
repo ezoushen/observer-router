@@ -36,7 +36,7 @@ Exercise one provider in isolation with a throwaway router on another port whose
 | Path | Contents |
 | --- | --- |
 | `observer-router.py` | The router. Single file, no third-party imports. |
-| `test_observer_router.py` | Tests for config loading, request building, chain failover over HTTP, compaction, the power and idle gates, and quota blocks. |
+| `test_observer_router.py` | Tests for config loading, request building, chain failover over HTTP, cut-off replies and buffered streams, group blocks, compaction, the power and idle gates, and quota blocks. |
 | `config.example.toml` | The documented config template. The live config is `~/.config/observer-router/config.toml`, outside the repository. |
 | `com.ezou.observer-router.plist` | launchd deployment: interpreter and script paths. |
 | `docs/researches/` | Investigations: question, method, evidence, conclusion. |
@@ -120,5 +120,10 @@ These are recorded, not started. Do not act on any of them without the owner's a
 - In plugin **13.24.8** the observation queue is **in-memory**. `pending_messages` in the database
   is vestigial — nothing writes it. A worker restart discards queued work, so the retry cushion
   holds only while the worker process stays up.
+- Plugin **15.2.1** (running since at least 2026-10-26) asks observers for `max_tokens` 4096 at
+  temperature 0.3 and streams them. Its stream idle timeout, `CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS`
+  (90 s), runs from the request until the router's response headers arrive, so every failed
+  attempt before the answering one counts against it. It stores the complete blocks of a reply cut
+  off at `finish_reason: length`, which is why the router serves one when no other tier answers.
 - `--prompt-cache-bytes` is not enforced in mlx_lm's streaming insertion path; sequence count is
   the effective bound on the lane's cache.

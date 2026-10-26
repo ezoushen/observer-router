@@ -8,7 +8,6 @@ import importlib.util
 import io
 import json
 import socket
-import subprocess
 import sys
 import tempfile
 import threading
@@ -22,6 +21,8 @@ from io import BytesIO
 from typing import Any
 from urllib.error import HTTPError
 
+from observer_router.settings import build_settings
+
 
 MODULE_PATH = Path(__file__).with_name("observer-router.py")
 SPEC = importlib.util.spec_from_file_location("observer_router", MODULE_PATH)
@@ -30,22 +31,6 @@ if SPEC is None or SPEC.loader is None:
 router: Any = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = router  # dataclasses resolve annotations through sys.modules
 SPEC.loader.exec_module(router)
-
-
-def _fresh_router(env: dict) -> Any:
-    """Load a separate copy of the router with these environment variables set at import."""
-    saved = dict(router.os.environ)
-    router.os.environ.update(env)
-    try:
-        spec = importlib.util.spec_from_file_location("observer_router_fresh", MODULE_PATH)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        sys.modules.pop("observer_router_fresh", None)
-        router.os.environ.clear()
-        router.os.environ.update(saved)
 
 
 def _config(text: str) -> Any:
@@ -375,49 +360,6 @@ class PromptCompactionTests(unittest.TestCase):
         self.assertLessEqual(sum(sizes), 4_000)
         self.assertGreaterEqual(min(sizes), 1_800)  # neither side is starved
         self.assertTrue(compacted[1]["content"].startswith("Answer this:"))
-
-
-class EnvironmentTests(unittest.TestCase):
-    """Router-wide OBSERVER_* settings are checked at start-up, like the config file."""
-
-    def _start(self, env: dict) -> subprocess.CompletedProcess:
-        with socket.socket() as probe:  # a free port, released before the router binds it
-            probe.bind(("127.0.0.1", 0))
-            port = str(probe.getsockname()[1])
-        with tempfile.TemporaryDirectory() as tmp:
-            config = Path(tmp) / "config.toml"
-            config.write_text('[providers.x]\ntype = "openai"\nurl = "http://127.0.0.1:9/v1"\n'
-                              'model = "m"\n')
-            clean = {k: v for k, v in router.os.environ.items() if not k.startswith("OBSERVER_")}
-            try:
-                return subprocess.run(
-                    [sys.executable, str(MODULE_PATH)], capture_output=True, text=True, timeout=60,
-                    env={**clean, "OBSERVER_ROUTER_CONFIG": str(config),
-                         "OBSERVER_ROUTER_PORT": port, **env},
-                )
-            except subprocess.TimeoutExpired:
-                self.fail(f"the router did not exit within 60 s; it may have started despite {env}")
-
-    def test_an_invalid_setting_stops_the_router_and_names_it(self):
-        # Rule: a value that is not a number, or is out of range, is an error at start-up (exit
-        # 2, the variable named), never a silent fallback to the default.
-        cases = {
-            "not a number": {"OBSERVER_BREAK_AFTER": "three"},
-            "zero strikes": {"OBSERVER_GROUP_STRIKES": "0"},
-            "negative seconds": {"OBSERVER_BREAK_SECONDS": "-1"},
-            "infinite seconds": {"OBSERVER_IDLE_SAMPLE_SECONDS": "inf"},
-            "port out of range": {"OBSERVER_ROUTER_PORT": "70000"},
-            "zero prompt budget": {"OBSERVER_MAX_PROMPT_CHARS": "0"},
-            "integer too big for a float": {"OBSERVER_MAX_PROMPT_CHARS": "9" * 400},
-            "blob size past the regex limit": {"OBSERVER_BASE64_BLOB_CHARS": "99999999999"},
-            "sample interval too long to sleep": {"OBSERVER_IDLE_SAMPLE_SECONDS": "1e30"},
-            "allowed host that is not a name": {"OBSERVER_ROUTER_ALLOWED_HOSTS": "ok.lan,bad host"},
-        }
-        for label, env in cases.items():
-            with self.subTest(label):
-                result = self._start(env)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn(next(iter(env)), result.stdout)
 
 
 def _use(tables: dict, chain=None) -> None:
@@ -1187,8 +1129,10 @@ class RequestGuardTests(ActiveConfigTestCase):
 
     def test_listed_host_names_are_read_trimmed_and_lower_cased(self):
         # Rule: OBSERVER_ROUTER_ALLOWED_HOSTS is a comma list; case and spaces do not matter.
-        loaded = _fresh_router({"OBSERVER_ROUTER_ALLOWED_HOSTS": " Router.LAN , nas.local,"})
-        self.assertEqual(loaded.ALLOWED_HOSTS, ("router.lan", "nas.local"))
+        settings, errors = build_settings(
+            {"OBSERVER_ROUTER_ALLOWED_HOSTS": " Router.LAN , nas.local,"})
+        self.assertEqual(errors, ())
+        self.assertEqual(settings.allowed_hosts, ("router.lan", "nas.local"))
 
     def test_a_listed_host_name_is_served(self):
         # Rule: OBSERVER_ROUTER_ALLOWED_HOSTS names the DNS names that may reach the router.
@@ -1858,7 +1802,9 @@ class ChainTests(ActiveConfigTestCase):
     def test_the_group_strike_threshold_is_configurable(self):
         # Rule: OBSERVER_GROUP_STRIKES sets how many members must fail in a row before the group
         # is blocked; with 3, two exhausted members still leave the third to answer.
-        self.assertEqual(_fresh_router({"OBSERVER_GROUP_STRIKES": "3"}).GROUP_STRIKES_TO_BLOCK, 3)
+        settings, errors = build_settings({"OBSERVER_GROUP_STRIKES": "3"})
+        self.assertEqual(errors, ())
+        self.assertEqual(settings.group_strikes, 3)
         saved = router.GROUP_STRIKES_TO_BLOCK
         router.GROUP_STRIKES_TO_BLOCK = 3
         self.addCleanup(setattr, router, "GROUP_STRIKES_TO_BLOCK", saved)

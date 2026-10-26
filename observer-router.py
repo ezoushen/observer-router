@@ -64,13 +64,15 @@ import time
 import tomllib
 import urllib.parse
 from dataclasses import dataclass, field
+from typing import Any
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from urllib.error import HTTPError
 from zoneinfo import ZoneInfo
 
-HOST = os.environ.get("OBSERVER_ROUTER_HOST", "127.0.0.1")
+from observer_router.settings import build_settings
+
 LOG_PREFIX = "[observer-router]"
 
 # A GPU lane runs one request at a time. ThreadingHTTPServer will happily run two upstream calls
@@ -96,48 +98,12 @@ def lane_guard(provider):
         return _lane_locks.setdefault(provider.url, threading.Lock())
 
 
-# Invalid OBSERVER_* settings, collected at import and reported by main() before it starts:
-# like a bad config file, a bad setting stops the router instead of silently using the default.
-_ENV_ERRORS: list[str] = []
-
-
-def _env_number(name: str, default, kind, minimum, maximum=math.inf):
-    text = os.environ.get(name, "").strip()
-    if not text:  # unset, or set empty (as a plist may leave it): the default
-        return default
-    try:
-        value = kind(text)
-    except ValueError:
-        value = None
-    finite = value is not None and (kind is int or math.isfinite(value))
-    if not finite or not minimum <= value <= maximum:
-        bound = f"at least {minimum}" if maximum == math.inf else f"{minimum} to {maximum}"
-        _ENV_ERRORS.append(f"{name} must be {'an integer' if kind is int else 'a number'} {bound}")
-        return default
-    return value
-
-
-def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 1_000_000_000) -> int:
-    return _env_number(name, default, int, minimum, maximum)
-
-
-_HOST_NAME = re.compile(r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*")
-
-
-def _env_hosts(name: str) -> tuple[str, ...]:
-    """A comma-separated list of DNS names, lower-cased; an invalid entry stops the router."""
-    names = tuple(part.strip().lower() for part in os.environ.get(name, "").split(",")
-                  if part.strip())
-    for entry in names:
-        if not _HOST_NAME.fullmatch(entry):
-            _ENV_ERRORS.append(f"{name} must be comma-separated DNS names")
-            return ()
-    return names
-
-
-def _env_float(name: str, default: float, minimum: float = 0.0,
-               maximum: float = math.inf) -> float:
-    return _env_number(name, default, float, minimum, maximum)
+# Invalid OBSERVER_* settings are collected by build_settings and reported by main() before it
+# starts: like a bad config file, a bad setting stops the router instead of silently using the
+# default. These aliases keep the rest of this module unchanged until the split moves them into
+# the runtime object.
+SETTINGS, _ENV_ERRORS = build_settings(os.environ)
+HOST = SETTINGS.host
 
 
 def _now() -> int:
@@ -147,25 +113,25 @@ def _now() -> int:
         return 0
 
 
-PORT = _env_int("OBSERVER_ROUTER_PORT", 1244, 1, 65535)
+PORT = SETTINGS.port
 # DNS names, besides localhost, that may appear in a request's Host header. A web page reaches the
 # router under a name an attacker's DNS first points here (rebinding); an IP literal cannot be
 # rebound, so those are always accepted and LAN access by address keeps working.
-ALLOWED_HOSTS = _env_hosts("OBSERVER_ROUTER_ALLOWED_HOSTS")
+ALLOWED_HOSTS = SETTINGS.allowed_hosts
 
 # Circuit breaker: a tier that fails repeatedly is skipped briefly instead of
 # consuming the budget on every call (free tiers rate-limit aggressively).
-BREAK_AFTER = _env_int("OBSERVER_BREAK_AFTER", 3)
-BREAK_SECONDS = _env_float("OBSERVER_BREAK_SECONDS", 60.0, 1.0)
+BREAK_AFTER = SETTINGS.break_after
+BREAK_SECONDS = SETTINGS.break_seconds
 
 # The lane's native context is 262,144 tokens, but accepting that many tokens would leave
 # no memory headroom for concurrent GPU clients. Character budgets are conservative token
 # estimates; the router folds deterministically rather than recursively asking an LLM to
 # summarize an already-oversized request.
-MAX_PROMPT_CHARS = _env_int("OBSERVER_MAX_PROMPT_CHARS", 240_000)
-MAX_FIELD_CHARS = _env_int("OBSERVER_MAX_FIELD_CHARS", 80_000)
-MIN_RETAINED_CHARS = _env_int("OBSERVER_MIN_RETAINED_CHARS", 1_024, 0)
-BASE64_BLOB_CHARS = _env_int("OBSERVER_BASE64_BLOB_CHARS", 16_384)
+MAX_PROMPT_CHARS = SETTINGS.max_prompt_chars
+MAX_FIELD_CHARS = SETTINGS.max_field_chars
+MIN_RETAINED_CHARS = SETTINGS.min_retained_chars
+BASE64_BLOB_CHARS = SETTINGS.base64_blob_chars
 MAX_ERROR_BODY_BYTES = 16_384
 
 def log(message: str) -> None:
@@ -174,7 +140,7 @@ def log(message: str) -> None:
 
 # --- power source -------------------------------------------------------------
 
-POWER_CACHE_SECONDS = _env_float("OBSERVER_POWER_CACHE_SECONDS", 30.0)
+POWER_CACHE_SECONDS = SETTINGS.power_cache_seconds
 
 _power_lock = threading.Lock()
 _power_cache = {"checked_at": 0.0, "source": "unknown"}
@@ -226,7 +192,7 @@ def power_source() -> str:
 # finishes between two observer calls still moves the submitted counter, but only a sampler
 # can say when. An unreadable lane leaves its last reading in place and ages into idle, so a
 # stopped or broken lane cannot keep the observer offline.
-IDLE_SAMPLE_SECONDS = _env_float("OBSERVER_IDLE_SAMPLE_SECONDS", 2.0, 0.1, 3600.0)
+IDLE_SAMPLE_SECONDS = SETTINGS.idle_sample_seconds
 # What counts as busy when a provider sets no idle_signal: Splash's request counters.
 SPLASH_SIGNAL = {
     "submitted": "splash_requests_submitted_total",
@@ -272,7 +238,7 @@ def parse_lane_metrics(text: str, signal: dict | None = None) -> tuple[int | Non
         return None
 
 
-def record_lane_sample(url: str, sample: tuple[int, int] | None, now: float) -> None:
+def record_lane_sample(url: str, sample: tuple[int | None, int] | None, now: float) -> None:
     """Fold one reading into the lane's activity: any new or in-flight request is activity."""
     if sample is None:
         return
@@ -401,9 +367,7 @@ def power_snapshot() -> dict:
 
 # --- config -------------------------------------------------------------------
 
-CONFIG_PATH = os.path.expanduser(
-    os.environ.get("OBSERVER_ROUTER_CONFIG", "~/.config/observer-router/config.toml")
-)
+CONFIG_PATH = SETTINGS.config_path
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -587,7 +551,7 @@ def _idle_signal(where: str, value: dict) -> dict:
             raise ConfigError(f"{where}: idle_signal {key} must be {kind}")
         return items
 
-    result = {key: names(key, value[key]) for key in value}
+    result: dict[str, Any] = {key: names(key, value[key]) for key in value}
     listed = [*result.get("finished", []), *result.get("in_flight", [])]
     if len(set(listed)) != len(listed):
         raise ConfigError(f"{where}: idle_signal names a metric more than once")
@@ -1123,6 +1087,8 @@ def _openrouter_quota(headers, body: str) -> tuple[float, str] | None:
         source = str(metadata.get("limit_source") or "")
     except (ValueError, AttributeError):
         pass
+    if reset is None:
+        return None
     try:
         return float(reset) / 1000.0, source or "X-RateLimit-Reset"
     except (TypeError, ValueError):
@@ -1344,7 +1310,7 @@ def _open(provider: Provider, body: dict, timeout: float, reasoning_mode: str | 
             provider.url, response.status, detail[:300], response.headers,
             BytesIO(detail.encode()),
         )
-        error.body_text = detail
+        setattr(error, "body_text", detail)
         raise error
     return UpstreamResponse(connection, response, sock)
 
@@ -1357,7 +1323,7 @@ def _error_body(error: HTTPError) -> str:
             body = error.read().decode("utf-8", "ignore")
         except Exception:
             body = ""
-        error.body_text = body
+        setattr(error, "body_text", body)
     return body
 
 
@@ -1588,7 +1554,7 @@ def record_failure(tier: str, failure: TierFailure) -> None:
 
 # Consecutive member timeouts or unexplained 429s, per group, that block the group; any member's
 # success resets it.
-GROUP_STRIKES_TO_BLOCK = _env_int("OBSERVER_GROUP_STRIKES", 2)
+GROUP_STRIKES_TO_BLOCK = SETTINGS.group_strikes
 _group_strikes: dict[str, int] = {}
 
 

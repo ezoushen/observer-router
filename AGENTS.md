@@ -20,9 +20,9 @@ as production changes.
 
 | Purpose | Command |
 | --- | --- |
-| Install dev tooling | `npm install` — pinned, needed once |
-| Tests | `npm test`, or `python3 -m unittest -v test_observer_router.py` |
-| Markdown lint | `npm run lint:md` — no arguments; rules live in `.markdownlint.json` |
+| Install dev tooling | `python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt` — pinned, needed once |
+| Tests | `python3 -m unittest -v test_observer_router.py` |
+| Markdown lint | `scripts/lint-md` — no arguments; rules live in `.pymarkdown` |
 | Router health | `curl -fsS http://127.0.0.1:1244/health` |
 | Router models | `curl -fsS http://127.0.0.1:1244/v1/models` |
 | Local lane check | `curl -fsS http://127.0.0.1:1243/v1/models` |
@@ -38,6 +38,9 @@ Exercise one provider in isolation with a throwaway router on another port whose
 | --- | --- |
 | `observer-router.py` | The router. Single file, no third-party imports. |
 | `test_observer_router.py` | Tests for config loading, request building, chain failover over HTTP, cut-off replies and buffered streams, group blocks, compaction, the power and idle gates, and quota blocks. |
+| `scripts/lint-md` | Runs the markdown linter over the repository, with no arguments. |
+| `requirements-dev.txt` | The pinned markdown linter and its dependencies; development only. |
+| `.pymarkdown` | The markdown rules. |
 | `config.example.toml` | The documented config template. The live config is `~/.config/observer-router/config.toml`, outside the repository. |
 | `com.ezou.observer-router.plist` | launchd deployment: interpreter and script paths. |
 | `docs/README.md` | Index of all documentation. |
@@ -90,7 +93,8 @@ Exercise one provider in isolation with a throwaway router on another port whose
 - **Never let a wrapped line start with punctuation or `#`**: punctuation attaches to the previous
   token, and a line starting with `#` renders as a heading.
 - Use reference links for long or repeated links, especially inside tables.
-- Run the linter before committing; `.markdownlint.json` holds the rules.
+- Run the linter before committing; `.pymarkdown` holds the rules. It also refuses a wrapped line
+  that starts with `#`, such as an issue number.
 
 ## Production safety
 

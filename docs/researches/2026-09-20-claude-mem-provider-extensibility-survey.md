@@ -83,9 +83,9 @@ claims to solve rotation would duplicate #3941.
   on failure, bound every history."
 - **Closed predecessors:** #680 (multi-model + provider chain) was closed unmerged as premature
   and over-scoped; #3645 (per-session/per-project model routing) was closed as not planned and
-  consolidated into plan-20 (#3608); #2196, #2527, #2704, #3652 and #3664 are all closed. The
-  #680 review left an explicit door open: model fallback "could be reconsidered with evidence of
-  regular quota exhaustion."
+  consolidated into plan-20 (#3608); #2196, #2527, #2704, #3652 and #3664 are all closed. The #680
+  review left an explicit door open: model fallback "could be reconsidered with evidence of regular
+  quota exhaustion."
 
 ### 5. No open issue or PR proposes a resolution seam
 

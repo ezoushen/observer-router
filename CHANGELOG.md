@@ -4,6 +4,25 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-27 — Python tooling for the markdown lint
+
+### Changed
+
+- **The markdown linter is `pymarkdownlnt`, installed with pip, not `markdownlint-cli2` through
+  npm.** The router and its tests never used Node. `requirements-dev.txt` pins the linter and its
+  dependencies, `.pymarkdown` holds the rules (the same limits as before: 100-column prose,
+  tables, code blocks and headings exempt), and `scripts/lint-md` runs it with no arguments. It
+  replaces `package.json`, `package-lock.json`, `.markdownlint.json` and
+  `.markdownlint-cli2.jsonc`; `npm test` was only an alias for the Python suite.
+- **Stricter in one place:** a wrapped line may not start with `#` (an issue number, say). Three
+  documents were re-wrapped to meet it, without changing a word. One append-only journal entry
+  that has such lines is left out of the scan, by name, in `scripts/lint-md`.
+- **Two rules differ.** `pymarkdownlnt` has no rule for undefined reference links (`MD052`), so a
+  `[text][name]` with no `[name]:` definition is no longer reported; it also flags
+  non-descriptive link text, which the old linter did not.
+- **Editors that read `.markdownlint.json`** no longer find it; the markdownlint extension for
+  VS Code needs its own settings, or the pymarkdown extension.
+
 ## 2026-10-27 — idle gate for any server
 
 ### Added

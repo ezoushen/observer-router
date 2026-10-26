@@ -1,0 +1,16 @@
+#!/bin/sh
+# Lint every Markdown file in the repository; takes no arguments.
+# Install the linter once: python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+cd "$(dirname "$0")/.." || exit 1
+linter=.venv/bin/pymarkdown
+if [ ! -x "$linter" ]; then
+    linter=$(command -v pymarkdown) || {
+        echo "pymarkdown not found; install it once:" >&2
+        echo "  python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt" >&2
+        exit 127
+    }
+fi
+# The journal entry below is append-only history whose wrapped lines start with issue numbers
+# (MD018); it may not be edited, so it is the one file left out.
+exec "$linter" scan -r --respect-gitignore \
+    -e docs/journals/2026-09-20-004-upstream-provider-seam-research.md .

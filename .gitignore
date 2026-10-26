@@ -5,9 +5,9 @@ __pycache__/
 # Service logs (the plist writes to /tmp/observer-router.log)
 *.log
 
-# Node tooling (development only: markdownlint)
-node_modules/
-
 # Local configuration; config.example.toml is the template
 config.toml
 *.env
+
+# Development environment for the markdown linter (see requirements-dev.txt)
+.venv/

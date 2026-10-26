@@ -79,9 +79,9 @@ You need Python 3.11 or later. Run the commands from the repository root.
 ## Development
 
 ```bash
-npm install          # once: pinned markdown linter
-npm test             # python3 -m unittest -v test_observer_router.py
-npm run lint:md
+python3 -m unittest -v test_observer_router.py                           # tests
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt   # once: the markdown linter
+scripts/lint-md                                                          # markdown lint
 ```
 
 Conventions for contributors and coding agents are in [`AGENTS.md`](AGENTS.md); notable changes

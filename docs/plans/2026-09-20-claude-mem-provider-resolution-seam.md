@@ -69,8 +69,9 @@ Three operator needs collide on the same missing seam:
 
 1. **Quota exhaustion** — a free-tier key dies mid-day and generation stalls; the workaround is a
    manual edit plus restart. The maintainer asked (#680) for evidence of regular quota exhaustion
-   before reconsidering fallback. That evidence now exists: #4068, #4076, #4083, #4109, #4114,
-   #4127, #4134, plus gateway incidents in #4075 and #3664.
+   before reconsidering fallback. That evidence now
+   exists: #4068, #4076, #4083, #4109, #4114, #4127, #4134, plus gateway incidents in #4075
+   and #3664.
 2. **Gateways** — LiteLLM and 9router are documented/supported paths, but two measured adapter
    defects (#3664 → PR #3668) show the gateway path is not yet first-class.
 3. **Multiple accounts** — the accepted answer today is the key pool in #3941; that solves
@@ -145,8 +146,8 @@ If filing a new issue is judged too likely to be read as re-raising #680, post t
 as a comment on **#2785 (plan-12)**, in its **Providers & auth** sub-area, framed as a child:
 
 > Requesting one bounded slice for the Providers & auth sub-area: a declarative deployment list
-> (`provider`, `model`, `baseUrl`, credential reference) with per-attempt resolution, so that
-> #3941's key pool and #3942's generic provider become two dimensions of one resolution point
+> (`provider`, `model`, `baseUrl`, credential reference) with per-attempt resolution, so
+> that #3941's key pool and #3942's generic provider become two dimensions of one resolution point
 > rather than two parallel mechanisms. Evidence of regular quota exhaustion, which #680's review
 > asked for: …
 

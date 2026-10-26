@@ -8,3 +8,7 @@ __pycache__/
 # Local configuration; config.example.toml is the template
 config.toml
 *.env
+
+# Workflow state and disposable worktrees (zloop dispatch)
+.scratch/
+.worktrees/

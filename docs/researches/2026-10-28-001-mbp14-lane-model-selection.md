@@ -217,3 +217,71 @@ faster model keeps the recall, and whether a larger Gemma is more faithful than 
   (26% against 6%), passes fewer summaries (10 against 11), and is far slower: cold TTFT 37 s, warm
   TTFT up to 43 s, decode 16.8 tokens/s. Its whole-reply times approach the router's 85 s deadline on
   the largest prompts, so it would also compress the lane's headroom.
+
+### Fidelity, preference and sampling noise
+
+Ornith 1.5 122B judged every reply blind: candidate identity stripped, A/B order decided by a hash of
+the input id, the judge itself never a candidate. A skipped input scores `unsupported`, because all 36
+rows are ones production recorded.
+
+| Model | all | mostly | partly | unsupported | useful | preferred over the lane |
+| --- | --- | --- | --- | --- | --- | --- |
+| qwen3.5-4b (today) | 2 | 2 | 14 | 17 | 14/36 | — |
+| gemma-4-e4b | 7 | 12 | 14 | 3 | 29/36 | 25 wins, 10 losses, 1 tie |
+| qwen3.5-9b | 1 | 1 | 16 | 18 | 14/36 | 4 wins, 7 losses, 25 ties |
+| lfm3-1.7b | 2 | 2 | 23 | 9 | 24/36 | 19 wins, 10 losses, 7 ties |
+| minicpm5-2b | 5 | 2 | 20 | 9 | 19/36 | 21 wins, 10 losses, 5 ties |
+| gemma-4-12b | 9 | 8 | 13 | 6 | 25/36 | 26 wins, 5 losses, 5 ties |
+
+Today's lane is the weakest of the six on fidelity: 17 of its 36 replies are unsupported by the record
+they were written from, and only 14 are useful. That is the same lane the router has been trusting at
+night.
+
+A spot check of ten Gemma judgements against their inputs agreed with the judge ten times out of ten,
+including the two disagreements about a narrative reading more into an output than it said.
+
+Sampling noise does not explain the difference. Eight inputs, three seeds each, temperature 0.3:
+
+| Model | skips per seed | observations per seed |
+| --- | --- | --- |
+| qwen3.5-4b | 6, 4, 6 | 2, 4, 2 |
+| gemma-4-e4b | 1, 1, 2 | 7, 7, 6 |
+
+The seed-to-seed spread is one or two inputs; the gap between the models is five.
+
+## Conclusion
+
+**Gemma 4 E4B should serve the lane.** On identical inputs it writes notes where today's lane skips
+(4 missed known-worthy rows against 25); its notes are supported by the record far more often (19
+`all` or `mostly` against 4); more of them are useful (29 of 36 against 14); a blind judge prefers them
+25 to 10; and it passes 11 of 12 summary cards against 9 of 12 — including the zero-workstream card
+that currently stalls the queue.
+
+The answer to the owner's question is yes: Gemma 4 E4B beats Qwen3.5-4B on this work, and by a margin
+larger than sampling noise.
+
+What it costs:
+
+- Whole-reply p50 rises from 7.0 s to 13.1 s and p90 from 16.1 s to 19.9 s, still inside the router's
+  85 s deadline and claude-mem's 90 s idle timeout. With `min_budget_s = 20` on the provider, a reply
+  arriving with 20 s of deadline left would land at the edge of that allowance; raising it to about
+  25 s is the config change that keeps the lane honest.
+- Weights grow from 3.03 GB to 5.15 GB; both fit the 16 GB machine with 32k context, and Gemma loaded
+  in 6.2 s.
+- The array-looking workstream id still defeats it, so that one card would still retry forever. A model
+  swap reduces the stuck-card class but the claude-mem retry/repair gap remains the durable fix.
+
+Rejected successors, with the evidence:
+
+- **Qwen3.5-9B** skips 29 of 36 known-worthy rows, is judged unsupported 18 times, and decodes at 16
+  tokens/s. More parameters did not buy recall.
+- **Gemma 4 12B** is slower (p50 42.4 s), invents more paths (26%), and passes fewer summaries than the
+  E4B. Scale inside the same family did not help.
+- **LFM3-1.7B** is the fastest measured (96 tokens/s) but fails all 12 summaries, invents 22% of its
+  paths, and truncates replies at the cap.
+- **MiniCPM5-2B** is fast and never skips, but 41% of its observations cite a path the input never
+  contained, and two replies came back as tool calls instead of observations.
+
+Nothing was changed. The live chain still reads `gemini, openrouter, ornith, cursor`, the router
+configuration is untouched, and MBP-14's own lane still serves Qwen3.5-4B on `:8030`. The cutover is
+the owner's decision.

@@ -142,14 +142,19 @@ signal rather than sensible noise filtering.
 | observations produced | 11, all with every required field |
 | observations with an invented path | 1/11 (9%) |
 | replies truncated at the 2048-token cap | 0/36 |
-| observer whole-reply wall | p50 7.0 s, p90 16.0 s |
+| observer whole-reply wall | p50 7.0 s, p90 16.1 s |
 | observer TTFT | p50 5.8 s |
-| prompt size | 9.2k-20.8k characters, median 12.4k |
+| prompt size | 9.2k-20.8k characters, median 13.0k |
 | summary cards passing `Oz` | 9/12 |
 | summary whole-reply wall | p50 3.1 s |
 | cold first-request TTFT (20.8k characters) | 10.6 s |
-| warm TTFT at the three largest prompts | 10.6 s, 12.2 s, 10.6 s |
-| decode | 51 tokens/s |
+| warm TTFT at the three largest prompts | 10.6 s, 12.1 s, 10.6 s |
+| decode | 55 tokens/s |
+
+Counters are reproducible: with the seed derived from the input id, a second run produced the same
+accepted/skipped/observation and summary verdicts for all 36 and 12 inputs. Timings vary between runs
+(decode measured 51 tokens/s in one and 55 in the next), so they are reported as measurements, not as
+constants.
 
 The three failing summary cards are the two pinned ones and one live card carrying a single
 workstream: the zero-workstream card invents a workstream, the array-looking id card returns

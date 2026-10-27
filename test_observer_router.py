@@ -25,7 +25,7 @@ from observer_router.settings import build_settings
 
 
 MODULE_PATH = Path(__file__).with_name("observer-router.py")
-SPEC = importlib.util.spec_from_file_location("observer_router", MODULE_PATH)
+SPEC = importlib.util.spec_from_file_location("observer_router_legacy", MODULE_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"cannot load {MODULE_PATH}")
 router: Any = importlib.util.module_from_spec(SPEC)
@@ -39,27 +39,6 @@ def _config(text: str) -> Any:
         path = Path(tmp) / "config.toml"
         path.write_text(text)
         return router.load_config(str(path))
-
-
-TWO_GEMINIS = """
-chain = ["gemini-b", "gemini-a", "local"]
-
-[providers.gemini-a]
-type = "gemini"
-model = "gemini-flash-lite-latest"
-api_key_env = "TEST_GEMINI_A"
-
-[providers.gemini-b]
-type = "gemini"
-model = "gemini-2.5-flash"
-api_key_env = "TEST_GEMINI_B"
-budget_s = 12
-
-[providers.local]
-type = "openai"
-url = "http://127.0.0.1:1242/v1/chat/completions"
-model = "local-model"
-"""
 
 
 POOL = """
@@ -90,133 +69,8 @@ members = ["a", "b", "c"]
 """
 
 
-class ConfigTests(unittest.TestCase):
-    """The config file defines named provider instances and the order they are tried in."""
-
-    def test_chain_names_instances_in_the_configured_order(self):
-        config = _config(TWO_GEMINIS)
-
-        self.assertEqual(config.chain, ("gemini-b", "gemini-a", "local"))
-        self.assertEqual(config.providers["gemini-a"].type, "gemini")
-        self.assertEqual(config.providers["gemini-b"].model, "gemini-2.5-flash")
-        self.assertEqual(config.providers["gemini-b"].budget, 12.0)
-
-    def test_type_defaults_fill_url_and_budget(self):
-        config = _config(TWO_GEMINIS)
-        gemini = config.providers["gemini-a"]
-
-        self.assertEqual(
-            gemini.url, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        )
-        self.assertEqual(gemini.budget, 18.0)
-        self.assertEqual(config.providers["local"].url, "http://127.0.0.1:1242/v1/chat/completions")
-
-    def test_chain_defaults_to_declaration_order(self):
-        config = _config(TWO_GEMINIS.replace('chain = ["gemini-b", "gemini-a", "local"]', ""))
-
-        self.assertEqual(config.chain, ("gemini-a", "gemini-b", "local"))
-
-    def test_invalid_configs_are_rejected_with_the_reason(self):
-        cases = {
-            "unknown type": ('[providers.x]\ntype = "anthropic"\nmodel = "m"\n', "type"),
-            "inline key": (
-                '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key = "AIza-secret"\n',
-                "api_key_env",
-            ),
-            "remote without key source": ('[providers.x]\ntype = "openrouter"\nmodel = "m"\n',
-                                          "api_key"),
-            "openai without url": ('[providers.x]\ntype = "openai"\nmodel = "m"\n', "url"),
-            "missing model": ('[providers.x]\ntype = "gemini"\napi_key_env = "K"\n', "model"),
-            "file without var": (
-                '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_file = "/k.env"\n',
-                "api_key_var",
-            ),
-            "unknown field": (
-                '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\nbudget = 3\n',
-                "budget",
-            ),
-            "unknown chain name": (
-                'chain = ["y"]\n[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\n',
-                "y",
-            ),
-            "no providers": ("chain = []\n", "provider"),
-            "string boolean": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
-                               'serial = "false"\n', "serial"),
-            "string number": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
-                              'idle_seconds = "30"\n', "idle_seconds"),
-            "bool budget": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
-                            'budget_s = true\n', "budget_s"),
-            "infinite budget": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
-                                'budget_s = inf\n', "budget_s"),
-            "metrics as a string": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
-                                    'model = "m"\nidle_metrics = "http://h/metrics"\n',
-                                    "idle_metrics"),
-            "template kwargs not a table": (
-                '[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
-                'chat_template_kwargs = "enable_thinking=false"\n', "chat_template_kwargs"),
-            "template kwargs on a remote type": (
-                '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\n'
-                'chat_template_kwargs = {enable_thinking = false}\n', "chat_template_kwargs"),
-            "https metrics": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
-                              'idle_metrics = ["https://h/metrics"]\n', "idle_metrics"),
-            "non-string url": ('[providers.x]\ntype = "openai"\nurl = 123\nmodel = "m"\n', "url"),
-            "bad url port": ('[providers.x]\ntype = "openai"\nurl = "http://h:abc/v1"\n'
-                             'model = "m"\n', "url"),
-            "non-string key env": ('[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = 1\n',
-                                   "api_key_env"),
-            "key pasted as env name": (
-                '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "sk-or-v1-abc"\n',
-                "api_key_env",
-            ),
-            "var without file": ('[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\n'
-                                 'api_key_var = "V"\n', "api_key_file"),
-            "chain as a string": ('chain = "x"\n[providers.x]\ntype = "gemini"\nmodel = "m"\n'
-                                  'api_key_env = "K"\n', "chain"),
-            "empty chain": ('chain = []\n[providers.x]\ntype = "gemini"\nmodel = "m"\n'
-                            'api_key_env = "K"\n', "chain"),
-            "duplicate chain name": ('chain = ["x", "x"]\n[providers.x]\ntype = "gemini"\n'
-                                     'model = "m"\napi_key_env = "K"\n', "x"),
-            "unknown top-level key": ('chian = ["x"]\n[providers.x]\ntype = "gemini"\n'
-                                      'model = "m"\napi_key_env = "K"\n', "chian"),
-            "prompt limit not an integer": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
-                                            'model = "m"\nmax_prompt_chars = "96000"\n',
-                                            "max_prompt_chars must be"),
-            "prompt limit below the retained floor": (
-                '[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
-                'max_prompt_chars = 2047\n', "max_prompt_chars must be at least"),
-            "breaker threshold zero": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
-                                       'model = "m"\nbreak_after = 0\n', "break_after must be"),
-            "breaker threshold boolean": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
-                                          'model = "m"\nbreak_after = true\n',
-                                          "break_after must be"),
-            "breaker seconds a string": ('[providers.x]\ntype = "gemini"\nmodel = "m"\n'
-                                         'api_key_env = "K"\nbreak_seconds = "60"\n',
-                                         "break_seconds must be"),
-            "gate on a remote type": (
-                '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\nserial = true\n',
-                "serial",
-            ),
-        }
-        for label, (text, needle) in cases.items():
-            with self.subTest(label):
-                with self.assertRaises(router.ConfigError) as caught:
-                    _config(text)
-                self.assertIn(needle, str(caught.exception))
-
-    def test_secret_values_never_appear_in_errors(self):
-        with self.assertRaises(router.ConfigError) as caught:
-            _config('[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key = "AIza-secret"\n')
-
-        self.assertNotIn("AIza-secret", str(caught.exception))
-        with self.assertRaises(router.ConfigError) as caught:
-            _config('[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "sk-or-v1-abc"\n')
-        self.assertNotIn("sk-or-v1-abc", str(caught.exception))
-
-    def test_the_shipped_example_is_a_valid_config(self):
-        config = router.load_config(str(MODULE_PATH.with_name("config.example.toml")))
-
-        self.assertEqual(config.chain, ("gemini", "openrouter", "cursor", "local"))
-        self.assertEqual(config.groups["gemini"], ("gemini-a", "gemini-b"))
+class GroupRotationTests(unittest.TestCase):
+    """A group starts each request one member further on, so its keys share the load."""
 
     def test_a_group_rotates_its_members_across_requests(self):
         config = _config(POOL)
@@ -234,41 +88,6 @@ class ConfigTests(unittest.TestCase):
             ["c", "a", "b", "local"],
             ["a", "b", "c", "local"],
         ])
-
-    def test_invalid_groups_are_rejected_with_the_reason(self):
-        providers = POOL.split("[groups.pool]")[0].replace('chain = ["pool", "local"]', "")
-        cases = {
-            "unknown member": ('[groups.g]\nmembers = ["a", "zz"]\n', "zz"),
-            "empty members": ('[groups.g]\nmembers = []\n', "members"),
-            "repeated member": ('[groups.g]\nmembers = ["a", "a"]\n', "repeats"),
-            "unknown field": ('[groups.g]\nmembers = ["a"]\nstrategy = "random"\n', "strategy"),
-            "groups not a table": ('groups = []\n', "groups must be"),
-            "name taken by a provider": ('[groups.a]\nmembers = ["b"]\n', "groups.a"),
-            "group inside a group": ('[groups.g]\nmembers = ["a"]\n[groups.h]\nmembers = ["g"]\n',
-                                     "groups.h"),
-            "member also in the chain": ('chain = ["g", "a"]\n[groups.g]\nmembers = ["a", "b"]\n',
-                                         "more than once"),
-        }
-        for label, (text, needle) in cases.items():
-            with self.subTest(label):
-                chain = "" if text.startswith("chain") else 'chain = ["g"]\n'
-                with self.assertRaises(router.ConfigError) as caught:
-                    _config(chain + text + providers)
-                self.assertIn(needle, str(caught.exception))
-
-    def test_removed_environment_variables_are_named(self):
-        stale = router.stale_environment({"OBSERVER_LOCAL_URL": "x", "OBSERVER_ROUTER_PORT": "1",
-                                          "OBSERVER_CURSOR_MODEL": "y", "HOME": "/h"})
-
-        self.assertEqual(stale, ["OBSERVER_CURSOR_MODEL", "OBSERVER_LOCAL_URL"])
-
-    def test_chain_override_selects_and_orders_instances(self):
-        config = _config(TWO_GEMINIS)
-
-        self.assertEqual(router.chain_override(config, "local, gemini-a"), ("local", "gemini-a"))
-        self.assertEqual(router.chain_override(config, ""), config.chain)
-        with self.assertRaises(router.ConfigError):
-            router.chain_override(config, "gemini-a,nope")
 
 
 class PromptCompactionTests(unittest.TestCase):
@@ -1595,21 +1414,6 @@ class ChainTests(ActiveConfigTestCase):
         self.assertLessEqual(self._chars_received(small), 3_000)
         self.assertEqual(self._chars_received(large), router._message_chars(messages))
         self.assertIn("contract", json.dumps(small.requests[0][1]["messages"]))  # system kept
-
-    def test_a_provider_limit_the_router_wide_guard_overrides_is_reported(self):
-        # Rule: a max_prompt_chars above the router-wide limit never acts, and start-up says so
-        # rather than letting /health suggest it does.
-        config = router.parse_config({"providers": {
-            "loose": {"type": "openai", "url": "http://h/v1", "model": "m",
-                      "max_prompt_chars": router.MAX_PROMPT_CHARS + 1},
-            "tight": {"type": "openai", "url": "http://h/v1", "model": "m",
-                      "max_prompt_chars": router.MAX_PROMPT_CHARS}}})
-
-        warnings = router.provider_warnings(config.providers)
-
-        self.assertEqual(len(warnings), 1, warnings)
-        self.assertIn("loose", warnings[0])
-        self.assertIn("OBSERVER_MAX_PROMPT_CHARS", warnings[0])
 
     def test_a_group_block_logs_each_members_interval(self):
         # Rule: members with different break_seconds are skipped for different times, and the

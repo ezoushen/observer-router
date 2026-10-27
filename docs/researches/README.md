@@ -16,7 +16,7 @@ here records what was found. They cross-link.
 | 2026-09-20 | [claude-mem retry and quota limits](2026-09-20-claude-mem-retry-and-quota-limits.md) | Are the free quotas enough, and does skipping the local tier lose work? (No, and no.) |
 | 2026-09-20 | [Router memory profile](2026-09-20-observer-router-memory-profile.md) | Does the router leak under oversized payloads? (No.) |
 | 2026-09-20 | [Provider and routing extensibility survey](2026-09-20-claude-mem-provider-extensibility-survey.md) | Does claude-mem expose a model selection policy, and is multi-account rotation already filed? |
-| 2026-10-28 | [MBP-14 lane model selection](2026-10-28-001-mbp14-lane-model-selection.md) | Which model should the local lane serve, and does Gemma 4 E4B beat Qwen3.5-4B? |
+| 2026-10-28 | [MBP-14 lane model selection](2026-10-28-001-mbp14-lane-model-selection.md) | Which model should the local lane serve: does Gemma 4 E4B beat Qwen3.5-4B, and what do Qwen3.5-9B, LFM3 and MiniCPM5 cost? |
 
 ## Provenance
 

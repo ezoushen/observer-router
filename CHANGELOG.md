@@ -4,6 +4,16 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-28 — the lane's model, measured
+
+### Research
+
+- **Gemma 4 E4B is proposed for the MBP-14 lane**, with the measurements behind it:
+  [model selection](docs/researches/2026-10-28-001-mbp14-lane-model-selection.md). On 36 real observer
+  inputs the current Qwen3.5-4B skipped 25 rows claude-mem itself recorded an observation for, and 17
+  of its 36 notes were judged unsupported by the record they were written from; Gemma 4 E4B skipped 4
+  and 3. Nothing live changed: the cutover is the owner's decision.
+
 ## 2026-10-27 — one deadline per request, and rejected models
 
 ### Added

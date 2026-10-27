@@ -16,12 +16,12 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from email.message import Message
-from io import BytesIO
 from typing import Any
 from urllib.error import HTTPError
 
 from observer_router.settings import build_settings
+
+from tests.support import FakeUpstream, completion
 
 
 MODULE_PATH = Path(__file__).with_name("observer-router.py")
@@ -170,179 +170,6 @@ class PowerGateTests(ActiveConfigTestCase):
         self.assertFalse(snapshot["ac_only_allowed"])
 
 
-class RequestBuildingTests(unittest.TestCase):
-    """Each provider instance sends its own model, key, and type-specific fields."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.env = dict(router.os.environ)
-
-    def tearDown(self):
-        router.os.environ.clear()
-        router.os.environ.update(self.env)
-        self.tmp.cleanup()
-
-    def _file(self, name: str, text: str) -> str:
-        path = Path(self.tmp.name) / name
-        path.write_text(text)
-        return str(path)
-
-    def _provider(self, **fields) -> Any:
-        table = {"type": "openai", "url": "http://127.0.0.1:9/v1/chat/completions", "model": "m"}
-        table.update(fields)
-        return router.parse_config({"providers": {"p": table}}).providers["p"]
-
-    def test_key_from_the_named_environment_variable(self):
-        router.os.environ["TEST_KEY_A"] = " abc "
-        provider = self._provider(type="gemini", api_key_env="TEST_KEY_A")
-
-        self.assertEqual(router.headers_for(provider)["Authorization"], "Bearer abc")
-
-    def test_key_from_a_dotenv_file(self):
-        path = self._file("bridge.cfg", '# comment\nPORT=8765\nexport BRIDGE_KEY="abc123"\n')
-        provider = self._provider(api_key_file=path, api_key_var="BRIDGE_KEY")
-
-        self.assertEqual(router.headers_for(provider)["Authorization"], "Bearer abc123")
-
-    def test_key_from_a_json_settings_file(self):
-        path = self._file("settings.json", json.dumps({"CLAUDE_MEM_GEMINI_API_KEY": "g-key"}))
-        provider = self._provider(
-            type="gemini", api_key_file=path, api_key_var="CLAUDE_MEM_GEMINI_API_KEY"
-        )
-
-        self.assertEqual(router.headers_for(provider)["Authorization"], "Bearer g-key")
-
-    def test_environment_wins_over_the_file(self):
-        router.os.environ["TEST_KEY_A"] = "from-env"
-        path = self._file("k.env", "K=from-file\n")
-        provider = self._provider(api_key_env="TEST_KEY_A", api_key_file=path, api_key_var="K")
-
-        self.assertEqual(router.headers_for(provider)["Authorization"], "Bearer from-env")
-
-    def test_a_missing_key_fails_the_provider_without_naming_a_value(self):
-        router.os.environ.pop("TEST_KEY_MISSING", None)
-        provider = self._provider(
-            type="gemini", api_key_env="TEST_KEY_MISSING",
-            api_key_file=str(Path(self.tmp.name) / "absent.env"), api_key_var="K",
-        )
-
-        with self.assertRaises(router.TierFailure) as caught:
-            router.headers_for(provider)
-        self.assertIn("p:", str(caught.exception))
-
-    def test_a_key_with_a_line_break_fails_without_echoing_it(self):
-        router.os.environ["TEST_KEY_A"] = "sk-SECRET\nsecond-line"
-        provider = self._provider(type="gemini", api_key_env="TEST_KEY_A")
-
-        with self.assertRaises(router.TierFailure) as caught:
-            router.headers_for(provider)
-        self.assertNotIn("SECRET", str(caught.exception))
-
-    def test_an_unreadable_key_file_is_named_as_the_cause(self):
-        provider = self._provider(
-            type="gemini", api_key_file=str(Path(self.tmp.name) / "absent.env"), api_key_var="K"
-        )
-
-        with self.assertRaises(router.TierFailure) as caught:
-            router.headers_for(provider)
-        self.assertIn("cannot read", str(caught.exception))
-
-    def test_dotenv_last_assignment_wins_and_inline_comments_are_dropped(self):
-        path = self._file("k.env", "K=old\nK=new # rotated\nQ='quoted # kept'\nR=\"r\" # note\n")
-
-        self.assertEqual(router.api_key(self._provider(api_key_file=path, api_key_var="K")), "new")
-        self.assertEqual(
-            router.api_key(self._provider(api_key_file=path, api_key_var="Q")), "quoted # kept"
-        )
-        self.assertEqual(router.api_key(self._provider(api_key_file=path, api_key_var="R")), "r")
-
-    def test_a_timeout_shortened_by_the_request_deadline_is_not_an_overload(self):
-        slow = FakeUpstream(body={"choices": [{"message": {"content": "x"}}]}, delay=2.0)
-        try:
-            provider = self._provider(url=slow.url, budget_s=4)
-
-            with self.assertRaises(router.TierFailure) as caught:
-                router.nonstream(provider, {"messages": []}, deadline=router.time.time() + 1)
-        finally:
-            slow.close()
-        self.assertFalse(caught.exception.overloaded)
-
-    def test_a_full_budget_timeout_is_an_overload(self):
-        slow = FakeUpstream(body={"choices": [{"message": {"content": "x"}}]}, delay=2.0)
-        try:
-            provider = self._provider(url=slow.url, budget_s=1)
-
-            with self.assertRaises(router.TierFailure) as caught:
-                router.nonstream(provider, {"messages": []}, deadline=router.time.time() + 60)
-        finally:
-            slow.close()
-        self.assertTrue(caught.exception.overloaded)
-
-    def test_an_openrouter_retry_that_times_out_keeps_the_overload_flag(self):
-        router.os.environ["TEST_KEY_A"] = "k"
-        upstream = FakeUpstream(script=[
-            (400, {"error": {"message": "Reasoning is mandatory for this endpoint"}}, 0.0),
-            (200, {"choices": [{"message": {"content": "x"}}]}, 2.0),
-        ])
-        try:
-            provider = self._provider(type="openrouter", url=upstream.url, budget_s=1,
-                                      api_key_env="TEST_KEY_A")
-
-            with self.assertRaises(router.TierFailure) as caught:
-                router.nonstream(provider, {"messages": []}, deadline=router.time.time() + 60)
-        finally:
-            upstream.close()
-        self.assertTrue(caught.exception.overloaded)
-
-    def test_keyless_openai_provider_sends_no_authorization(self):
-        self.assertNotIn("Authorization", router.headers_for(self._provider()))
-
-    def test_openrouter_sends_attribution_headers(self):
-        router.os.environ["TEST_KEY_A"] = "k"
-        provider = self._provider(
-            type="openrouter", api_key_env="TEST_KEY_A", site_url="https://x.test", app_name="me"
-        )
-
-        headers = router.headers_for(provider)
-
-        self.assertEqual(headers["HTTP-Referer"], "https://x.test")
-        self.assertEqual(headers["X-Title"], "me")
-
-    def test_payload_uses_the_instance_model_and_passes_sampling_fields(self):
-        body = {"messages": [{"role": "user", "content": "x"}], "max_tokens": 5, "seed": 1}
-
-        payload = router.payload_for(self._provider(model="composer-2.5"), body, None)
-
-        self.assertEqual(payload["model"], "composer-2.5")
-        self.assertEqual(payload["max_tokens"], 5)
-        self.assertNotIn("seed", payload)
-        self.assertNotIn("reasoning", payload)
-        self.assertNotIn("reasoning_effort", payload)
-
-    def test_chat_template_kwargs_are_sent_as_configured(self):
-        provider = self._provider(chat_template_kwargs={"enable_thinking": False})
-
-        payload = router.payload_for(provider, {"messages": []}, None)
-
-        self.assertEqual(payload["chat_template_kwargs"], {"enable_thinking": False})
-        self.assertNotIn("chat_template_kwargs", router.payload_for(self._provider(),
-                                                                    {"messages": []}, None))
-
-    def test_reasoning_effort_only_when_configured(self):
-        payload = router.payload_for(self._provider(reasoning_effort="none"), {"messages": []}, None)
-
-        self.assertEqual(payload["reasoning_effort"], "none")
-
-    def test_openrouter_reasoning_modes(self):
-        router.os.environ["TEST_KEY_A"] = "k"
-        provider = self._provider(type="openrouter", api_key_env="TEST_KEY_A")
-
-        disabled = router.payload_for(provider, {"messages": []}, "disabled")
-        excluded = router.payload_for(provider, {"messages": []}, "exclude")
-
-        self.assertEqual(disabled["reasoning"], {"enabled": False})
-        self.assertEqual(excluded["reasoning"], {"exclude": True})
-
 def _gemini_429(quota_ids, retry_delay="34s"):
     """A Gemini 429 in the shape the OpenAI-compatible endpoint returned on 2026-09-24."""
     return json.dumps([{"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": [
@@ -353,13 +180,6 @@ def _gemini_429(quota_ids, retry_delay="34s"):
         ]},
         {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay},
     ]}}], indent=2)
-
-
-def _http_error(code, body, headers=None):
-    message = Message()
-    for key, value in (headers or {}).items():
-        message[key] = value
-    return HTTPError("https://example.invalid", code, "error", message, BytesIO(body.encode()))
 
 
 class BreakerInterplayTests(ActiveConfigTestCase):
@@ -376,12 +196,6 @@ class BreakerInterplayTests(ActiveConfigTestCase):
     def tearDown(self):
         super().tearDown()
         router.BREAKERS = self.saved
-
-    def test_error_body_survives_repeated_reads(self):
-        error = _http_error(400, "Reasoning is mandatory for this endpoint")
-
-        self.assertTrue(router._is_mandatory_reasoning_error(error))
-        self.assertIn("mandatory", router._snippet(error))
 
     def test_quota_failure_blocks_the_tier_with_its_reason(self):
         until = router.time.time() + 3600
@@ -465,7 +279,7 @@ class RequestGuardTests(ActiveConfigTestCase):
 
     def setUp(self):
         super().setUp()
-        self.upstream = FakeUpstream(body=_completion("hi"))
+        self.upstream = FakeUpstream(body=completion("hi"))
         _use({"p": {"type": "openai", "url": self.upstream.url, "model": "m"}})
         self.saved_hosts = router.ALLOWED_HOSTS
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), router.RouterHandler)
@@ -621,76 +435,6 @@ class RequestGuardTests(ActiveConfigTestCase):
         self.assertEqual(status, 200)
 
 
-class FakeUpstream:
-    """An OpenAI-compatible upstream that answers every POST with one scripted reply."""
-
-    def __init__(self, status=200, body=None, stream_pieces=None, delay=0.0, stall=0.0, script=(),
-                 finish=None, pace=0.0):
-        """delay holds back the whole reply; stall sends the headers, then holds back the body.
-        script lists (status, body, delay) replies for the first requests, in order. finish is
-        the stream's last frame before [DONE]: (finish_reason, usage). pace holds back each
-        stream frame after the first, so a stream that keeps arriving can outlast a budget."""
-        self.status, self.body, self.stream_pieces = status, body, stream_pieces
-        self.finish, self.pace = finish, pace
-        self.delay, self.stall, self.script = delay, stall, list(script)
-        self.requests: list[tuple[dict, dict]] = []
-        upstream = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                return
-
-            def do_POST(self):
-                length = int(self.headers.get("Content-Length") or 0)
-                upstream.requests.append((dict(self.headers), json.loads(self.rfile.read(length))))
-                status, body, delay = (upstream.script.pop(0) if upstream.script
-                                       else (upstream.status, upstream.body, upstream.delay))
-                if upstream.stream_pieces is not None and status == 200:
-                    frames = [
-                        f"data: {json.dumps({'model': 'fake', 'choices': [{'delta': delta}]})}\n\n"
-                        for delta in upstream.stream_pieces
-                    ]
-                    if upstream.finish:
-                        reason, usage = upstream.finish
-                        frames.append("data: " + json.dumps({"model": "fake", "usage": usage, "choices": [
-                            {"delta": {}, "finish_reason": reason}]}) + "\n\n")
-                    frames.append("data: [DONE]\n\n")
-                    data = "".join(frames).encode()
-                    content_type = "text/event-stream"
-                else:
-                    data = json.dumps(body).encode()
-                    content_type = "application/json"
-                time.sleep(delay)
-                try:
-                    self.send_response(status)
-                    self.send_header("Content-Type", content_type)
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.flush()
-                    time.sleep(upstream.stall)
-                    if upstream.pace and content_type == "text/event-stream":
-                        for index, frame in enumerate(frames):
-                            time.sleep(upstream.pace if index else 0)
-                            self.wfile.write(frame.encode())
-                            self.wfile.flush()
-                    else:
-                        self.wfile.write(data)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass  # the router gave up on this upstream
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.url = f"http://127.0.0.1:{self.server.server_port}/v1/chat/completions"
-
-    def close(self):
-        self.server.shutdown()
-        self.server.server_close()
-
-
-def _completion(text):
-    return {"model": "fake", "choices": [{"message": {"content": text}, "finish_reason": "stop"}]}
-
-
 class ChainTests(ActiveConfigTestCase):
     """Requests through the router's HTTP surface fail over between named instances."""
 
@@ -745,7 +489,7 @@ class ChainTests(ActiveConfigTestCase):
     def test_a_quota_blocked_instance_fails_over_to_a_second_instance_of_the_same_type(self):
         first = self._upstream(status=429, body=json.loads(_gemini_429(
             ["GenerateRequestsPerDayPerProjectPerModel-FreeTier"]))[0])
-        second = self._upstream(body=_completion("from b"))
+        second = self._upstream(body=completion("from b"))
         self._two_geminis(first, second)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
@@ -763,7 +507,7 @@ class ChainTests(ActiveConfigTestCase):
     def test_a_blocked_instance_is_skipped_on_the_next_request(self):
         first = self._upstream(status=429, body=json.loads(_gemini_429(
             ["GenerateRequestsPerDayPerProjectPerModel-FreeTier"]))[0])
-        second = self._upstream(body=_completion("from b"))
+        second = self._upstream(body=completion("from b"))
         self._two_geminis(first, second)
 
         self._post({"messages": [{"role": "user", "content": "one"}]})
@@ -786,7 +530,7 @@ class ChainTests(ActiveConfigTestCase):
 
     def test_all_instances_failing_names_each_one(self):
         first = self._upstream(status=503, body={"error": "down"})
-        second = self._upstream(body=_completion(""))
+        second = self._upstream(body=completion(""))
         self._two_geminis(first, second)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
@@ -801,7 +545,7 @@ class ChainTests(ActiveConfigTestCase):
         # Rule: finish_reason=length is a truncated reply, not a result; the next tier answers.
         cut = self._upstream(body={"model": "fake", "choices": [
             {"message": {"content": "1 2 3 4 5 6"}, "finish_reason": "length"}]})
-        second = self._upstream(body=_completion("from b"))
+        second = self._upstream(body=completion("from b"))
         self._two_geminis(cut, second)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
@@ -911,7 +655,7 @@ class ChainTests(ActiveConfigTestCase):
         # Rule: whatever the upstream puts in usage, a cut-off reply is a failed attempt.
         cut = self._upstream(body={"model": "fake", "usage": "n/a", "choices": [
             {"message": {"content": "partial"}, "finish_reason": "length"}]})
-        second = self._upstream(body=_completion("from b"))
+        second = self._upstream(body=completion("from b"))
         self._two_geminis(cut, second)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
@@ -926,7 +670,7 @@ class ChainTests(ActiveConfigTestCase):
                                                               "completion_tokens": 2048},
                                    "choices": [{"message": {"content": text},
                                                 "finish_reason": "length"}]})
-        self._two_geminis(cut, self._upstream(body=_completion("from b")))
+        self._two_geminis(cut, self._upstream(body=completion("from b")))
 
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self._post({"messages": [{"role": "user", "content": "hello"}]})
@@ -1041,7 +785,7 @@ class ChainTests(ActiveConfigTestCase):
         # Rule: max_prompt_chars tightens the router-wide prompt guard for one provider; a
         # provider without it gets the full, router-bounded prompt on the same request.
         small = self._upstream(status=503, body={"error": "down"})
-        large = self._upstream(body=_completion("ok"))
+        large = self._upstream(body=completion("ok"))
         _use({"small": {"type": "openai", "url": small.url, "model": "s",
                         "max_prompt_chars": 3_000},
               "large": {"type": "openai", "url": large.url, "model": "l"}})
@@ -1073,7 +817,7 @@ class ChainTests(ActiveConfigTestCase):
 
     def test_a_provider_prompt_limit_above_the_request_changes_nothing(self):
         # Rule: a limit only acts on a prompt that exceeds it.
-        upstream = self._upstream(body=_completion("ok"))
+        upstream = self._upstream(body=completion("ok"))
         _use({"p": {"type": "openai", "url": upstream.url, "model": "m",
                     "max_prompt_chars": 50_000}})
         messages = [{"role": "user", "content": "x" * 10_000}]
@@ -1087,7 +831,7 @@ class ChainTests(ActiveConfigTestCase):
         # default provider is still tried until it has failed BREAK_AFTER times.
         strict = self._upstream(status=500, body={"error": "x"})
         default = self._upstream(status=500, body={"error": "x"})
-        last = self._upstream(body=_completion("ok"))
+        last = self._upstream(body=completion("ok"))
         _use({"strict": {"type": "openai", "url": strict.url, "model": "s", "break_after": 1},
               "default": {"type": "openai", "url": default.url, "model": "d"},
               "last": {"type": "openai", "url": last.url, "model": "l"}})
@@ -1102,7 +846,7 @@ class ChainTests(ActiveConfigTestCase):
         # when a group block skips it.
         failing = self._upstream(status=500, body={"error": "x"})
         down = self._upstream(status=503, body={"error": "down"})
-        last = self._upstream(body=_completion("ok"))
+        last = self._upstream(body=completion("ok"))
         router.configure(router.parse_config({
             "chain": ["own", "pool", "last"],
             "providers": {
@@ -1135,9 +879,9 @@ class ChainTests(ActiveConfigTestCase):
         }))
 
     def test_a_group_spreads_consecutive_requests_across_its_members(self):
-        first = self._upstream(body=_completion("from a"))
-        second = self._upstream(body=_completion("from b"))
-        fallback = self._upstream(body=_completion("fallback"))
+        first = self._upstream(body=completion("from a"))
+        second = self._upstream(body=completion("from b"))
+        fallback = self._upstream(body=completion("fallback"))
         self._pool(first, second, fallback)
 
         answers = [json.loads(self._post({"messages": [{"role": "user", "content": "hi"}]})[1])
@@ -1148,8 +892,8 @@ class ChainTests(ActiveConfigTestCase):
 
     def test_a_failing_member_retries_inside_the_group_before_falling_back(self):
         first = self._upstream(status=500, body={"error": "broken key"})
-        second = self._upstream(body=_completion("from b"))
-        fallback = self._upstream(body=_completion("fallback"))
+        second = self._upstream(body=completion("from b"))
+        fallback = self._upstream(body=completion("fallback"))
         self._pool(first, second, fallback)
 
         answers = [json.loads(self._post({"messages": [{"role": "user", "content": "hi"}]})[1])
@@ -1175,8 +919,8 @@ class ChainTests(ActiveConfigTestCase):
         overloaded = self._upstream(status=503, body=[{"error": {
             "code": 503, "status": "UNAVAILABLE",
             "message": "This model is currently experiencing high demand."}}])
-        siblings = [self._upstream(body=_completion("sibling")) for _ in range(2)]
-        fallback = self._upstream(body=_completion("fallback"))
+        siblings = [self._upstream(body=completion("sibling")) for _ in range(2)]
+        fallback = self._upstream(body=completion("fallback"))
         self._pool_of([overloaded, *siblings], fallback)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
@@ -1189,9 +933,9 @@ class ChainTests(ActiveConfigTestCase):
                         breaker)
 
     def test_one_timeout_moves_on_to_the_next_member_without_blocking_the_group(self):
-        slow = self._upstream(body=_completion("late"), delay=3.0)
-        sibling = self._upstream(body=_completion("sibling"))
-        fallback = self._upstream(body=_completion("fallback"))
+        slow = self._upstream(body=completion("late"), delay=3.0)
+        sibling = self._upstream(body=completion("sibling"))
+        fallback = self._upstream(body=completion("fallback"))
         self._pool_of([slow, sibling], fallback, budget=1)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
@@ -1200,9 +944,9 @@ class ChainTests(ActiveConfigTestCase):
         self.assertEqual(self._get_health()["breaker"]["gemini-1"]["reason"], "")
 
     def test_two_members_timing_out_in_a_row_block_the_group(self):
-        slow = [self._upstream(body=_completion("late"), delay=3.0) for _ in range(2)]
-        sibling = self._upstream(body=_completion("sibling"))
-        fallback = self._upstream(body=_completion("fallback"))
+        slow = [self._upstream(body=completion("late"), delay=3.0) for _ in range(2)]
+        sibling = self._upstream(body=completion("sibling"))
+        fallback = self._upstream(body=completion("fallback"))
         self._pool_of([*slow, sibling], fallback, budget=1)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
@@ -1219,8 +963,8 @@ class ChainTests(ActiveConfigTestCase):
         # Rule: a 429 that names no quota, from two members in a row, is the model out of
         # capacity rather than one key: every member is skipped for the breaker interval.
         exhausted = [self._upstream(status=429, body=self.EXHAUSTED) for _ in range(2)]
-        sibling = self._upstream(body=_completion("sibling"))
-        fallback = self._upstream(body=_completion("fallback"))
+        sibling = self._upstream(body=completion("sibling"))
+        fallback = self._upstream(body=completion("fallback"))
         self._pool_of([*exhausted, sibling], fallback)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
@@ -1253,8 +997,8 @@ class ChainTests(ActiveConfigTestCase):
         router.GROUP_STRIKES_TO_BLOCK = 3
         self.addCleanup(setattr, router, "GROUP_STRIKES_TO_BLOCK", saved)
         exhausted = [self._upstream(status=429, body=self.EXHAUSTED) for _ in range(2)]
-        sibling = self._upstream(body=_completion("sibling"))
-        self._pool_of([*exhausted, sibling], self._upstream(body=_completion("fallback")))
+        sibling = self._upstream(body=completion("sibling"))
+        self._pool_of([*exhausted, sibling], self._upstream(body=completion("fallback")))
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
 
@@ -1263,8 +1007,8 @@ class ChainTests(ActiveConfigTestCase):
     def test_one_member_exhausted_does_not_block_the_group(self):
         # Rule: a single unexplained 429 can be one key; its siblings are still tried.
         exhausted = self._upstream(status=429, body=self.EXHAUSTED)
-        siblings = [self._upstream(body=_completion("sibling")) for _ in range(2)]
-        fallback = self._upstream(body=_completion("fallback"))
+        siblings = [self._upstream(body=completion("sibling")) for _ in range(2)]
+        fallback = self._upstream(body=completion("fallback"))
         self._pool_of([exhausted, *siblings], fallback)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
@@ -1297,8 +1041,8 @@ class ChainTests(ActiveConfigTestCase):
     def test_a_quota_429_blocks_only_that_member(self):
         exhausted = self._upstream(status=429, body=json.loads(_gemini_429(
             ["GenerateRequestsPerDayPerProjectPerModel-FreeTier"]))[0])
-        sibling = self._upstream(body=_completion("sibling"))
-        fallback = self._upstream(body=_completion("fallback"))
+        sibling = self._upstream(body=completion("sibling"))
+        fallback = self._upstream(body=completion("fallback"))
         self._pool_of([exhausted, sibling], fallback)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})

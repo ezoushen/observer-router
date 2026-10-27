@@ -88,13 +88,16 @@ from observer_router.idle import (
     LaneLocks,
     read_lane,
 )
+from observer_router.failure import TierFailure
 from observer_router.idle import parse_lane_metrics as _parse_lane_metrics
+from observer_router.log import log
 from observer_router.power import PowerGate, probe_power
+from observer_router.providers import api_key, headers_for, payload_for
 from observer_router.prompt import PromptGuard, PromptLimits
 from observer_router.prompt import message_chars as _message_chars_of
 from observer_router.settings import build_settings
+from observer_router.upstream import iter_stream, nonstream
 
-LOG_PREFIX = "[observer-router]"
 
 LANES = LaneLocks()
 
@@ -138,10 +141,6 @@ MAX_PROMPT_CHARS = SETTINGS.max_prompt_chars
 MAX_FIELD_CHARS = SETTINGS.max_field_chars
 MIN_RETAINED_CHARS = SETTINGS.min_retained_chars
 BASE64_BLOB_CHARS = SETTINGS.base64_blob_chars
-MAX_ERROR_BODY_BYTES = 16_384
-
-def log(message: str) -> None:
-    print(f"{LOG_PREFIX} [{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
 
 
 # --- power source -------------------------------------------------------------
@@ -335,421 +334,6 @@ def breaker_snapshot() -> dict:
 
 
 # --- tier requests ------------------------------------------------------------
-
-class TierFailure(Exception):
-    """Raised when a tier cannot produce usable content.
-
-    retry_at/quota are set when the provider said which quota ran out and when it resets.
-    """
-
-    def __init__(self, message: str, retry_at: float | None = None, quota: str = "",
-                 overloaded: str = "", partial: tuple[str, str] | None = None):
-        super().__init__(message)
-        self.retry_at = retry_at
-        self.quota = quota
-        # (served model, text) of a reply cut off at the token limit: served when no later tier
-        # answers, since claude-mem keeps a cut-off reply's complete blocks.
-        self.partial = partial
-        # Why the model itself, not this key, looks out of capacity: "unavailable" (HTTP 503),
-        # "exhausted" (an HTTP 429 that names no quota), or "timeout" (a socket read timeout that
-        # used the provider's whole budget). Every key in the provider's group would fail the
-        # same way. Empty otherwise.
-        self.overloaded = overloaded
-
-
-def payload_for(provider: Provider, body: dict, reasoning_mode: str | None) -> dict:
-    payload = {
-        "model": provider.model,
-        "messages": body.get("messages") or [],
-        "stream": bool(body.get("stream")),
-    }
-    for key in ("temperature", "max_tokens", "top_p", "stop"):
-        if body.get(key) is not None:
-            payload[key] = body[key]
-    if provider.reasoning_effort:
-        # Splash honours reasoning_effort ("none" switches thinking off) and ignores
-        # chat_template_kwargs entirely. Without it a reasoning model spends the whole
-        # max_tokens budget thinking and returns content=None with finish_reason=length, which
-        # the router then reports as "empty content". Unset for lanes that reject unknown
-        # fields (mlx_lm does).
-        payload["reasoning_effort"] = provider.reasoning_effort
-    if provider.chat_template_kwargs:
-        # For servers that ignore reasoning_effort but render the template themselves (mtplx,
-        # vLLM): {enable_thinking = false} is what turns Qwen thinking off there.
-        payload["chat_template_kwargs"] = provider.chat_template_kwargs
-    if provider.type == "openrouter" and reasoning_mode == "disabled":
-        # Without this, reasoning models burn the whole budget on reasoning and
-        # return empty content.
-        payload["reasoning"] = {"enabled": False}
-    elif provider.type == "openrouter" and reasoning_mode == "exclude":
-        # Some endpoints reject enabled=false with HTTP 400; keep reasoning on but
-        # hide it from the response.
-        payload["reasoning"] = {"exclude": True}
-    return payload
-
-
-_QUOTED_VALUE = re.compile(r"""(["'])(.*)\1\s*(?:#.*)?""")
-
-
-def _key_from_file(provider: Provider, path: str, var: str) -> str:
-    """Read one key from a dotenv-style file, or from a JSON object when the path ends .json.
-
-    Reading the key where it already lives (a bridge's env file, claude-mem's settings) keeps
-    one copy of the secret, so rotating it there cannot silently break the provider. The file
-    is re-read on every call, so a rotation takes effect without a restart.
-    """
-    found = ""
-    try:
-        with open(path) as handle:
-            if path.endswith(".json"):
-                value = json.load(handle).get(var)  # top-level keys only
-                return str(value).strip() if value else ""
-            for line in handle:  # the last assignment wins, as when the file is sourced
-                name, sep, value = line.strip().removeprefix("export ").partition("=")
-                if not sep or name.strip() != var:
-                    continue
-                quoted = _QUOTED_VALUE.fullmatch(value.strip())
-                found = quoted.group(2) if quoted else value.split(" #", 1)[0].strip()
-    except OSError as error:
-        raise TierFailure(f"{provider.name}: cannot read {path}: {error.strerror}") from None
-    except (ValueError, AttributeError) as error:
-        # The decoder's message is not echoed: it can quote the file's contents.
-        raise TierFailure(
-            f"{provider.name}: cannot parse {path}: {type(error).__name__}"
-        ) from None
-    return found
-
-
-def api_key(provider: Provider) -> str:
-    """Return the provider's key: api_key_env first, then api_key_var in api_key_file."""
-    if provider.api_key_env:
-        key = os.environ.get(provider.api_key_env, "").strip()
-        if key:
-            return key
-    if provider.api_key_file:
-        return _key_from_file(provider, provider.api_key_file, provider.api_key_var)
-    return ""
-
-
-def headers_for(provider: Provider) -> dict:
-    headers = {"Content-Type": "application/json"}
-    wants_key = provider.api_key_env or provider.api_key_file
-    if wants_key:
-        key = api_key(provider)
-        if not key:
-            sources = " or ".join(filter(None, (
-                provider.api_key_env and f"${provider.api_key_env}",
-                provider.api_key_file and f"{provider.api_key_var} in {provider.api_key_file}",
-            )))
-            raise TierFailure(f"{provider.name}: no API key in {sources}")
-        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in key):
-            # http.client would reject the header and quote the whole key in its error.
-            raise TierFailure(f"{provider.name}: API key contains control characters")
-        headers["Authorization"] = f"Bearer {key}"
-    if provider.type == "openrouter":
-        if provider.site_url:
-            headers["HTTP-Referer"] = provider.site_url
-        headers["X-Title"] = provider.app_name
-    return headers
-
-
-# Upstream traffic goes through http.client directly: only the HTTPS and HTTP
-# constructors are ever used, so file:/custom schemes cannot resolve here.
-
-
-class UpstreamResponse:
-    """File-like wrapper that closes both the response and its connection."""
-
-    def __init__(self, connection, response, sock=None):
-        self._connection = connection
-        self._response = response
-        self._sock = sock
-
-    def read(self, size: int | None = None):
-        if size is None:
-            return self._response.read()
-        return self._response.read(size)
-
-    def __iter__(self):
-        return iter(self._response)
-
-    def set_timeout(self, seconds: float) -> None:
-        """Bound the next reads; the socket keeps this until it is set again."""
-        if self._sock is not None:
-            self._sock.settimeout(seconds)
-
-    def close(self) -> None:
-        try:
-            self._response.close()
-        finally:
-            self._connection.close()
-
-
-def _connect(provider: Provider, timeout: float):
-    """Open an http(s) connection for a provider, rejecting any other scheme."""
-    parts = urllib.parse.urlsplit(provider.url)
-    host = parts.hostname
-    if not host:
-        raise TierFailure(f"{provider.name}: URL has no host")
-    if parts.scheme == "https":
-        return http.client.HTTPSConnection(host, parts.port or 443, timeout=timeout)
-    if parts.scheme == "http":
-        return http.client.HTTPConnection(host, parts.port or 80, timeout=timeout)
-    raise TierFailure(f"{provider.name}: refusing non-http(s) URL")
-
-
-def _timeout_kind(provider: Provider, error: BaseException, timeout: float) -> str:
-    """ "timeout" for a read timeout that had the provider's whole budget; a timeout the request
-    deadline cut short says nothing about the provider."""
-    return "timeout" if isinstance(error, TimeoutError) and timeout >= provider.budget else ""
-
-
-def _open(provider: Provider, body: dict, timeout: float, reasoning_mode: str | None):
-    parts = urllib.parse.urlsplit(provider.url)
-    payload = json.dumps(payload_for(provider, body, reasoning_mode)).encode()
-    headers = headers_for(provider)
-    headers["Content-Length"] = str(len(payload))
-    connection = _connect(provider, timeout)
-    try:
-        connection.request("POST", parts.path or "/", body=payload, headers=headers)
-        sock = connection.sock  # getresponse drops it from a connection that will close
-        response = connection.getresponse()
-    except Exception as error:
-        connection.close()
-        raise TierFailure(
-            f"{provider.name}: {type(error).__name__}: {error}",
-            overloaded=_timeout_kind(provider, error, timeout),
-        ) from error
-    if response.status >= 400:
-        try:
-            # Bounded but whole: a Gemini 429 names its quota only past the first ~1.5 KB.
-            detail = response.read(MAX_ERROR_BODY_BYTES).decode("utf-8", "ignore")
-        except Exception:
-            detail = ""
-        connection.close()
-        error = HTTPError(
-            provider.url, response.status, detail[:300], response.headers,
-            BytesIO(detail.encode()),
-        )
-        setattr(error, "body_text", detail)
-        raise error
-    return UpstreamResponse(connection, response, sock)
-
-
-def _error_body(error: HTTPError) -> str:
-    """Return an upstream error body; the stream behind HTTPError can be read only once."""
-    body = getattr(error, "body_text", None)
-    if body is None:
-        try:
-            body = error.read().decode("utf-8", "ignore")
-        except Exception:
-            body = ""
-        setattr(error, "body_text", body)
-    return body
-
-
-def _snippet(error: HTTPError) -> str:
-    return _error_body(error)[:160]
-
-
-def _http_failure(provider: Provider, error: HTTPError) -> TierFailure:
-    quota = quota_reset(provider.type, error.code, error.headers, _error_body(error))
-    name = provider.name
-    if quota:
-        retry_at, quota_name = quota
-        return TierFailure(
-            f"{name}: HTTP {error.code}: quota {quota_name} exhausted", retry_at, quota_name
-        )
-    # A 429 that names no quota (Gemini's bare RESOURCE_EXHAUSTED) has no reset to wait for, and
-    # has been seen on every key of a group within the same minute: shared model capacity.
-    overloaded = {503: "unavailable", 429: "exhausted"}.get(error.code, "")
-    return TierFailure(f"{name}: HTTP {error.code}: {_snippet(error)}", overloaded=overloaded)
-
-
-def _is_mandatory_reasoning_error(error: HTTPError) -> bool:
-    if error.code != 400:
-        return False
-    detail = _error_body(error).lower()
-    return "reasoning" in detail and "mandatory" in detail
-
-
-def _open_with_reasoning_retry(
-    provider: Provider, body: dict, timeout: float, reasoning_mode: str | None
-):
-    """Open a provider, retrying an OpenRouter endpoint once with reasoning.exclude when it
-    refuses to run with reasoning disabled."""
-    name = provider.name
-    try:
-        return _open(provider, body, timeout, reasoning_mode)
-    except HTTPError as error:
-        if provider.type == "openrouter" and _is_mandatory_reasoning_error(error):
-            log(f"{name}: endpoint requires reasoning; retrying with reasoning.exclude")
-            try:
-                return _open(provider, body, timeout, "exclude")
-            except HTTPError as retry_error:
-                raise _http_failure(provider, retry_error) from retry_error
-            except TierFailure:
-                raise
-            except Exception as retry_error:
-                raise TierFailure(
-                    f"{name}: {type(retry_error).__name__}: {retry_error}"
-                ) from retry_error
-        raise _http_failure(provider, error) from error
-    except TierFailure:
-        raise
-    except Exception as error:
-        raise TierFailure(f"{name}: {type(error).__name__}: {error}") from error
-
-
-def _budget_left(budget: float, deadline: float) -> float:
-    return max(1.0, min(budget, deadline - time.time()))
-
-
-def _reasoning_mode(provider: Provider) -> str | None:
-    return "disabled" if provider.type == "openrouter" else None
-
-
-def iter_stream(provider: Provider, body: dict, deadline: float) -> Iterator[tuple[str, str]]:
-    """Yield ('meta', served_model) once, then ('delta', text) frames.
-
-    Raises TierFailure when the provider produces no content or errors before the first
-    content delta, so the caller can still fall through to the next provider. A buffer_stream
-    provider yields nothing until its stream ends, so a reply cut off at the token limit
-    (finish_reason=length) fails over too; any other provider's cut-off reply raises only after
-    its text was forwarded.
-    """
-    with lane_guard(provider):
-        yield from _iter_stream_locked(provider, body, deadline, _reasoning_mode(provider))
-
-
-def _iter_stream_locked(provider, body, deadline, reasoning_mode) -> Iterator[tuple[str, str]]:
-    timeout = _budget_left(provider.budget, deadline)
-    # A buffered reply reaches the client only once it is whole, so the budget to first content
-    # covers all of it: each read may wait only for what is left of it.
-    whole_by = time.time() + timeout
-    response = _open_with_reasoning_retry(provider, body, timeout, reasoning_mode)
-
-    served = None
-    finish = None
-    usage = {}
-    pieces: list[str] = []
-    committed = False
-
-    def bound_next_read():
-        left = whole_by - time.time()
-        if left <= 0:
-            raise TierFailure(f"{provider.name}: reply not finished within {timeout:.0f}s",
-                              overloaded=_timeout_kind(provider, TimeoutError(), timeout))
-        response.set_timeout(left)
-
-    try:
-        if provider.buffer_stream:
-            bound_next_read()
-        for raw in _lines_until_content(provider, response, timeout, lambda: committed):
-            if provider.buffer_stream:
-                bound_next_read()
-            line = raw.decode("utf-8", "ignore").strip()
-            if not line.startswith("data: "):
-                continue
-            data = line[6:].strip()
-            if data == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-            except ValueError:
-                continue
-            served = served or chunk.get("model")
-            usage = chunk.get("usage") or usage
-            choice = (chunk.get("choices") or [{}])[0]
-            finish = choice.get("finish_reason") or finish
-            piece = (choice.get("delta") or {}).get("content")
-            if not piece:
-                continue  # reasoning deltas are intentionally dropped
-            pieces.append(piece)
-            if provider.buffer_stream:
-                continue  # held back until finish_reason says whether the reply is whole
-            if not committed:
-                committed = True
-                yield ("meta", served or provider.model)
-            yield ("delta", piece)
-    finally:
-        response.close()
-    if not pieces:
-        raise TierFailure(f"{provider.name}: stream produced no content")
-    if finish == "length":
-        raise _cut_off(provider, body, "".join(pieces), usage, served or provider.model)
-    if not committed and not finish:
-        raise TierFailure(f"{provider.name}: stream ended without a finish_reason")
-    if not committed:
-        yield ("meta", served or provider.model)
-        yield ("delta", "".join(pieces))
-
-
-def _lines_until_content(provider: Provider, response, timeout: float, committed) -> Iterator[bytes]:
-    """Yield the response's lines. A read error before the stream commits -- an upstream that
-    sent its headers and then stalled -- becomes a TierFailure, so the chain can still fail over;
-    after it, the error propagates to the committed stream's handler."""
-    lines = iter(response)
-    while True:
-        try:
-            raw = next(lines)
-        except StopIteration:
-            return
-        except (OSError, http.client.HTTPException) as error:
-            if committed():
-                raise
-            raise TierFailure(
-                f"{provider.name}: {type(error).__name__} before first content: {error}",
-                overloaded=_timeout_kind(provider, error, timeout),
-            ) from error
-        yield raw
-
-
-def nonstream(provider: Provider, body: dict, deadline: float):
-    """Return (response_dict, content) for a provider, or raise TierFailure."""
-    with lane_guard(provider):
-        timeout = _budget_left(provider.budget, deadline)
-        response = _open_with_reasoning_retry(provider, body, timeout, _reasoning_mode(provider))
-        try:
-            payload = json.load(response)
-        except Exception as error:
-            raise TierFailure(
-                f"{provider.name}: unreadable response: {error}",
-                overloaded=_timeout_kind(provider, error, timeout),
-            ) from error
-        finally:
-            response.close()
-    choice = (payload.get("choices") or [{}])[0]
-    content = ((choice.get("message") or {}).get("content") or "").strip()
-    if not content:
-        raise TierFailure(
-            f"{provider.name}: empty content (finish_reason={choice.get('finish_reason')})"
-        )
-    if choice.get("finish_reason") == "length":
-        raise _cut_off(provider, body, content, payload.get("usage") or {},
-                       payload.get("model") or provider.model)
-    return payload, content
-
-
-CUT_OFF_PREVIEW_CHARS = 80
-
-
-def _cut_off(provider: Provider, body: dict, text: str, usage: dict, model: str) -> TierFailure:
-    """Log a reply that hit the token limit, then return its failure.
-
-    The head and tail are logged because no body is kept anywhere else: they are what tells a
-    model stuck in a loop from a genuinely long answer.
-    """
-    usage = usage if isinstance(usage, dict) else {}
-    log(
-        f"tier {provider.name} cut off at the token limit: "
-        f"prompt_tokens={usage.get('prompt_tokens', '?')} "
-        f"prompt_chars={_message_chars(body.get('messages') or [])} "
-        f"completion_tokens={usage.get('completion_tokens', '?')} chars={len(text)} "
-        f"head={text[:CUT_OFF_PREVIEW_CHARS]!r} tail={text[-CUT_OFF_PREVIEW_CHARS:]!r}"
-    )
-    return TierFailure(f"{provider.name}: reply cut off at the token limit", partial=(model, text))
-
 
 def record_failure(tier: str, failure: TierFailure) -> None:
     if failure.partial:
@@ -946,7 +530,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 continue
             started = time.time()
             try:
-                generator = iter_stream(provider, fit_prompt(provider, body), deadline)
+                generator = iter_stream(provider, fit_prompt(provider, body), deadline, LANES)
                 _, served = next(generator)  # blocks until the first content delta
             except StopIteration:
                 tier_failed(tier, "no frames")
@@ -1026,7 +610,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 continue
             started = time.time()
             try:
-                payload, content = nonstream(provider, fit_prompt(provider, body), deadline)
+                payload, content = nonstream(provider, fit_prompt(provider, body), deadline, LANES)
             except TierFailure as failure:
                 record_failure(tier, failure)
                 attempted.append(f"{tier}({failure})")

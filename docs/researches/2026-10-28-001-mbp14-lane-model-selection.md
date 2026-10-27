@@ -288,8 +288,10 @@ What it costs:
   config change that keeps the skip decision honest, not a number this measurement alone settles.
 - Weights grow from 3.03 GB to 5.15 GB; both fit the 16 GB machine with 32k context, and Gemma loaded
   in 6.2 s.
-- The array-looking workstream id still defeats it, so that one card would still retry forever. A model
-  swap reduces the stuck-card class but the claude-mem retry/repair gap remains the durable fix.
+- The array-looking workstream id still defeats Gemma, and differently from today's lane: where Qwen
+  shortened it, Gemma returns that one id as two workstreams, `tensorfold-local` and
+  `uzu-vs-locals-mbp14`, so that card would still retry forever. A model swap reduces the stuck-card
+  class, but claude-mem's retry and repair gap remains the durable fix.
 
 Rejected successors, with the evidence:
 

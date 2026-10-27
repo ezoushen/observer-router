@@ -61,11 +61,12 @@ production uses.
 ### Candidates
 
 Everything must fit 16 GB with 32k context; macOS lets the GPU use about 12 GB, so weights stay under
-roughly 7 GB.
+roughly 7 GB. The sizes below are the Hugging Face files' own byte counts on 2026-10-28, not a
+measurement record; no record file carries a weights field.
 
 | Model | HF id | Weights | Engine |
 | --- | --- | --- | --- |
-| Qwen3.5-4B (today) | `mlx-community/Qwen3.5-4B-MLX-4bit` | 2.9 GB | `locals` |
+| Qwen3.5-4B (today) | `mlx-community/Qwen3.5-4B-MLX-4bit` | 3.03 GB | `locals` |
 | Gemma 4 E4B | `mlx-community/gemma-4-e4b-it-4bit` | 5.15 GB | `locals` |
 | Qwen3.5-9B | `mlx-community/Qwen3.5-9B-MLX-4bit` | 5.35 GB | `locals` |
 | LFM3-1.7B | `LiquidAI/LFM3-1.7B` (GGUF `Q4_K_M`) | 1.1 GB | `llama.cpp` built `19ff817` |
@@ -80,9 +81,12 @@ therefore not comparable to `locals`; its quality on identical prompts is.
 
 ### Scoring
 
-Acceptance is mechanical: the observer reply must pass `oFe` (the `<observation>` parser, the 9 types
-and 7 concepts of the active mode) or produce a `<skip_summary />`, and the summary reply must pass
-`Oz`. Objective counters on every reply: accepted, required fields non-empty, invalid type or concept,
+Acceptance is mechanical: the observer reply must pass `oFe`, the bundle's own `<observation>` parser,
+or produce a `<skip_summary />`, and the summary reply must pass `Oz`. The parser and both summary
+validators are the bundle's code, called unmodified; the 9 types and 7 concepts are read from the
+mode's own lists, and the membership check over them is harness code rather than another bundle call.
+
+Objective counters on every reply: accepted, required fields non-empty, invalid type or concept,
 an invented path (a `files_read`/`files_modified` entry absent from the input), truncation at the token
 cap, and skip rate.
 
@@ -146,7 +150,7 @@ signal rather than sensible noise filtering.
 | observations produced | 11, all with every required field |
 | observations with an invented path | 1/11 (9%) |
 | replies truncated at the 2048-token cap | 0/36 |
-| observer whole-reply wall | p50 7.0 s, p90 16.1 s |
+| observer whole-reply wall | p50 7.0 s, p90 16.1 s, max 19.3 s |
 | observer TTFT | p50 5.8 s |
 | prompt size | 9.2k-20.8k characters, median 13.0k |
 | summary cards passing `Oz` | 9/12 |
@@ -175,7 +179,7 @@ temperatures, token caps and seeds, served alone on its own port with the lane's
 | qwen3.5-4b (today) | 25/36 | 11 | 100% | 9% | 0% | 7.0 s | 16.1 s | 5.8 s |
 | gemma-4-e4b | 4/36 | 32 | 100% | 6% | 0% | 13.1 s | 19.9 s | 5.7 s |
 | qwen3.5-9b | 29/36 | 7 | 100% | 0% | 0% | 15.0 s | 32.2 s | 13.6 s |
-| lfm3-1.7b | 10/36 | 41 | 73% | 22% | 5.6% | 9.2 s | 25.2 s | 3.0 s |
+| lfm3-1.7b (llama.cpp) | 10/36 | 41 | 73% | 22% | 5.6% | 9.2 s | 25.2 s | 3.0 s |
 
 | Model | Summary `Oz` pass | Workstream ids exact | Summary wall p50 | Cold TTFT | Warm TTFT | Decode |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -191,11 +195,14 @@ What the counters say:
   invented paths at 6% of observations. It also passes the zero-workstream summary card that stalls
   today's lane; only the array-looking-id card still defeats it. Its cost is latency: whole-reply p50
   13.1 s against 7.0 s, still well inside the 85 s deadline.
-- **Qwen3.5-9B is worse at this job than the smaller sibling.** It skips 29 of 36 known-worthy rows,
-  and it is slow: decode 16 tokens/s against 55, warm TTFT around 20 s on 20.8k-character prompts.
-  Scale did not buy recall here.
-- **LFM3-1.7B is the fastest and the least faithful.** It prefills 20.8k characters in under a second
-  and decodes at 96 tokens/s, but it records almost everything: 41 observations from 36 rows, 22% of
+- **Qwen3.5-9B is worse at this job than the smaller sibling.** It skips 29 of 36 known-worthy rows.
+  It is also slow, though its decode figure is measured on only eight tokens: its warm TTFT on
+  20.8k-character prompts is 20.0-22.8 s against today's 10.6 s, and its whole-reply p50 is 15.0 s
+  against 7.0 s. Scale did not buy recall here.
+- **LFM3-1.7B is the fastest and the least faithful.** On llama.cpp — so its speed is not comparable
+  to `locals`, and its observer requests ran at a 4096-token cap where `locals` caps at 2048 — it
+  prefills 20.8k characters in under a second and decodes at 96 tokens/s, but it records almost
+  everything: 41 observations from 36 rows, 22% of
   them carrying a path the input never contained, 27% missing a required field, and two replies cut off
   at the 4096-token cap (one produced 13 observations in one reply). Its `json_object` summaries are
   valid JSON but invent workstream ids on every card, so it fails all 12.
@@ -212,7 +219,9 @@ faster model keeps the recall, and whether a larger Gemma is more faithful than 
 
 - **MiniCPM5-2B is the fastest and the least accurate.** It never skips and answers with TTFT of
   0.4-0.7 s at 68 tokens/s, but 41% of its observations carry a path the input never contained, and
-  two of its twelve summaries fail on shape. Speed alone does not make it a successor.
+  two of its twelve summaries fail on shape. Two of its 36 replies (`tu_86523`, `tu_84458`) came back
+  as `<function name="shell">` tool calls instead of observations, which the stored replies show and
+  the record counts only as `accepted: false`. Speed alone does not make it a successor.
 - **Gemma 4 12B is not better than the E4B at this work.** It skips more (9 against 4), invents more
   (26% against 6%), passes fewer summaries (10 against 11), and is far slower: cold TTFT 37 s, warm
   TTFT up to 43 s, decode 16.8 tokens/s. Its whole-reply times approach the router's 85 s deadline on
@@ -226,7 +235,7 @@ rows are ones production recorded.
 
 | Model | all | mostly | partly | unsupported | useful | preferred over the lane |
 | --- | --- | --- | --- | --- | --- | --- |
-| qwen3.5-4b (today) | 2 | 2 | 14 | 17 | 14/36 | — |
+| qwen3.5-4b (today) | 3 | 2 | 14 | 17 | 15/36 | — |
 | gemma-4-e4b | 7 | 12 | 14 | 3 | 29/36 | 25 wins, 10 losses, 1 tie |
 | qwen3.5-9b | 1 | 1 | 16 | 18 | 14/36 | 4 wins, 7 losses, 25 ties |
 | lfm3-1.7b | 2 | 2 | 23 | 9 | 24/36 | 19 wins, 10 losses, 7 ties |
@@ -234,8 +243,10 @@ rows are ones production recorded.
 | gemma-4-12b | 9 | 8 | 13 | 6 | 25/36 | 26 wins, 5 losses, 5 ties |
 
 Today's lane is the weakest of the six on fidelity: 17 of its 36 replies are unsupported by the record
-they were written from, and only 14 are useful. That is the same lane the router has been trusting at
-night.
+they were written from, and only 15 are useful. That is the same lane the router has been trusting at
+night. One of its rows, `tu_86597`, was first judged with an answer cut off mid-string by the judge's
+token budget; it was judged again with a larger budget and reads `all`, which is how the table counts
+it.
 
 A spot check of ten Gemma judgements against their inputs agreed with the judge ten times out of ten,
 including the two disagreements about a narrative reading more into an output than it said.
@@ -247,13 +258,14 @@ Sampling noise does not explain the difference. Eight inputs, three seeds each, 
 | qwen3.5-4b | 6, 4, 6 | 2, 4, 2 |
 | gemma-4-e4b | 1, 1, 2 | 7, 7, 6 |
 
-The seed-to-seed spread is one or two inputs; the gap between the models is five.
+The seed-to-seed spread is one or two inputs; the gap between the models is three to five depending on
+which seeds are compared, largest at seed 11.
 
 ## Conclusion
 
 **Gemma 4 E4B should serve the lane.** On identical inputs it writes notes where today's lane skips
 (4 missed known-worthy rows against 25); its notes are supported by the record far more often (19
-`all` or `mostly` against 4); more of them are useful (29 of 36 against 14); a blind judge prefers them
+`all` or `mostly` against 5); more of them are useful (29 of 36 against 15); a blind judge prefers them
 25 to 10; and it passes 11 of 12 summary cards against 9 of 12 — including the zero-workstream card
 that currently stalls the queue.
 
@@ -262,10 +274,16 @@ larger than sampling noise.
 
 What it costs:
 
-- Whole-reply p50 rises from 7.0 s to 13.1 s and p90 from 16.1 s to 19.9 s, still inside the router's
-  85 s deadline and claude-mem's 90 s idle timeout. With `min_budget_s = 20` on the provider, a reply
-  arriving with 20 s of deadline left would land at the edge of that allowance; raising it to about
-  25 s is the config change that keeps the lane honest.
+- Whole-reply p50 rises from 7.0 s to 13.1 s, p90 from 16.1 s to 19.9 s, and the tail reaches 41.5 s
+  (against today's 19.3 s maximum). These are model-server times: they exclude the serial-lane wait
+  production adds, so "inside the 85 s deadline" holds for an uncontended lane. Under `buffer_stream`
+  the whole reply must finish inside the budget, which makes the tail — not the p50 — the number that
+  decides fail-over.
+- `min_budget_s = 20` gates entry and lane waiting, and its comment cites a 20 s production median that
+  includes lane queueing, not this effort's 7.0 s server-side p50. With Gemma's p90 at 19.9 s and its
+  maximum at 41.5 s, 20 s admits replies that can outlast the allowance; sizing it from the p90 and
+  the observed tail (about 25 s, and no lower than the tail the lane will tolerate) is the config
+  change that keeps the skip decision honest, not a number this measurement alone settles.
 - Weights grow from 3.03 GB to 5.15 GB; both fit the 16 GB machine with 32k context, and Gemma loaded
   in 6.2 s.
 - The array-looking workstream id still defeats it, so that one card would still retry forever. A model

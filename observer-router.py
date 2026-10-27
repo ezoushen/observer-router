@@ -58,7 +58,6 @@ import json
 import math
 import os
 import re
-import subprocess
 import threading
 import time
 import tomllib
@@ -82,31 +81,23 @@ from observer_router.config import (
     provider_warnings,
     stale_environment,
 )
+from observer_router.idle import (
+    IdleMonitor,
+    LaneLocks,
+    read_lane,
+)
+from observer_router.idle import parse_lane_metrics as _parse_lane_metrics
+from observer_router.power import PowerGate, probe_power
 from observer_router.settings import build_settings
 
 LOG_PREFIX = "[observer-router]"
 
-# A GPU lane runs one request at a time. ThreadingHTTPServer will happily run two upstream calls
-# at once, and two concurrent prefills on the same lane both slow down and inflate its KV pool --
-# the pool has to be sized for the concurrency, not for the request. claude-mem already sets
-# CLAUDE_MEM_MAX_CONCURRENT_AGENTS=1, but nothing here enforced it, so any second caller on
-# :1244 would have broken that assumption silently. A provider with serial = true takes the
-# lock of its URL, so two instances pointed at one lane share it; remote providers hold no GPU.
-_lane_locks: dict[str, threading.Lock] = {}
-_lane_locks_lock = threading.Lock()
-
-
-class _NullGuard:
-    def __enter__(self): return self
-    def __exit__(self, *a): return False
+LANES = LaneLocks()
 
 
 def lane_guard(provider):
     """Hold the provider's lane for the duration of a call when it is serial."""
-    if not provider.serial:
-        return _NullGuard()
-    with _lane_locks_lock:
-        return _lane_locks.setdefault(provider.url, threading.Lock())
+    return LANES.guard(provider)
 
 
 # Invalid OBSERVER_* settings are collected by build_settings and reported by main() before it
@@ -151,131 +142,25 @@ def log(message: str) -> None:
 
 # --- power source -------------------------------------------------------------
 
-POWER_CACHE_SECONDS = SETTINGS.power_cache_seconds
-
-_power_lock = threading.Lock()
-_power_cache = {"checked_at": 0.0, "source": "unknown"}
+POWER = PowerGate(probe_power, SETTINGS.power_cache_seconds, log)
 
 
 def power_source() -> str:
-    """Return "AC Power", "Battery Power", or "unknown", cached briefly.
-
-    The probe shells out to pmset, so the answer is cached for POWER_CACHE_SECONDS to keep
-    it off the hot path. Any failure (pmset absent, hung, or output the router cannot read)
-    returns "unknown" rather than guessing.
-    """
-    with _power_lock:
-        now = time.time()
-        if now - _power_cache["checked_at"] < POWER_CACHE_SECONDS:
-            return _power_cache["source"]
-        source = "unknown"
-        try:
-            completed = subprocess.run(
-                ["pmset", "-g", "batt"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if completed.returncode == 0:
-                headline = (completed.stdout or "").splitlines()[:1]
-                if headline and "AC Power" in headline[0]:
-                    source = "AC Power"
-                elif headline and "Battery Power" in headline[0]:
-                    source = "Battery Power"
-        except Exception:  # unreadable power state must not take the observer offline
-            source = "unknown"
-        if source != _power_cache["source"]:
-            log(f"power source {_power_cache['source']} -> {source}")
-        _power_cache["checked_at"] = now
-        _power_cache["source"] = source
-        return source
+    """Return "AC Power", "Battery Power", or "unknown", cached briefly."""
+    return POWER.source()
 
 
 # --- idle gate ----------------------------------------------------------------
 
-# A local provider shares the GPU with interactive lanes on the same machine. With idle_metrics
-# naming those lanes' Prometheus /metrics URLs, the provider runs only after every one of them
-# has been idle for its idle_seconds, so an observer prefill never competes with a turn the user
-# is waiting on. The grace period matters because an agent loop pauses between requests while
-# its tools run.
-#
-# A background sampler, not a per-request probe, tracks activity: a request that starts and
-# finishes between two observer calls still moves the submitted counter, but only a sampler
-# can say when. An unreadable lane leaves its last reading in place and ages into idle, so a
-# stopped or broken lane cannot keep the observer offline.
-IDLE_SAMPLE_SECONDS = SETTINGS.idle_sample_seconds
-# What counts as busy when a provider sets no idle_signal: Splash's request counters.
-SPLASH_SIGNAL = {
-    "submitted": "splash_requests_submitted_total",
-    "finished": ["splash_requests_completed_total", "splash_requests_cancelled_total",
-                 "splash_requests_failed_total"],
-}
-
-_idle_lock = threading.Lock()
-# url -> {"submitted": last submitted count, "busy_at": last time activity was seen}
-_lane_activity: dict[str, dict] = {}
+IDLE = IdleMonitor(read_lane, SETTINGS.idle_sample_seconds)
 
 
 def parse_lane_metrics(text: str, signal: dict | None = None) -> tuple[int | None, int] | None:
-    """Return (submitted, in_flight) from a Prometheus /metrics body, or None when a named metric
-    is missing or unreadable.
-
-    The signal is an idle_signal table: counters, {submitted, finished}, give in-flight as
-    submitted minus the finished counters; gauges, {in_flight}, are summed (a labelled gauge
-    adds up over its label sets) and have no submitted count, so None stands for it.
-    """
-    signal = signal or SPLASH_SIGNAL
-    wanted = set(signal["in_flight"] if "in_flight" in signal
-                 else [signal["submitted"], *signal["finished"]])
-    values: dict[str, float] = {}
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        head, _, value = line.rstrip().rpartition(" ")
-        name = head.rstrip().partition("{")[0]
-        if name in wanted:
-            try:
-                values[name] = values.get(name, 0.0) + float(value)
-            except ValueError:
-                return None
-    if wanted - values.keys():
-        return None
-    try:
-        if "in_flight" in signal:
-            return None, int(sum(values.values()))
-        submitted = int(values[signal["submitted"]])
-        return submitted, submitted - int(sum(values[name] for name in signal["finished"]))
-    except (ValueError, OverflowError):  # NaN, infinity: not a reading
-        return None
+    return _parse_lane_metrics(text, signal)
 
 
 def record_lane_sample(url: str, sample: tuple[int | None, int] | None, now: float) -> None:
-    """Fold one reading into the lane's activity: any new or in-flight request is activity."""
-    if sample is None:
-        return
-    submitted, in_flight = sample
-    with _idle_lock:
-        state = _lane_activity.setdefault(url, {"submitted": submitted, "busy_at": 0.0})
-        if in_flight > 0 or submitted != state["submitted"]:
-            state["busy_at"] = now
-        state["submitted"] = submitted
-
-
-def _read_lane(url: str, signal: dict | None = None) -> tuple[int | None, int] | None:
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme != "http" or not parts.hostname:
-        return None
-    connection = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=1.0)
-    try:
-        connection.request("GET", parts.path or "/metrics")
-        response = connection.getresponse()
-        if response.status != 200:
-            return None
-        return parse_lane_metrics(response.read().decode("utf-8", "ignore"), signal)
-    except Exception:  # an unreachable lane is not activity
-        return None
-    finally:
-        connection.close()
+    IDLE.record(url, sample, now)
 
 
 def watched_lanes() -> tuple[str, ...]:
@@ -293,53 +178,20 @@ def lane_signal(url: str) -> dict | None:
 
 
 def sample_lanes_once() -> None:
-    for url in watched_lanes():
-        record_lane_sample(url, _read_lane(url, lane_signal(url)), time.time())
-
-
-def _sample_lanes_forever() -> None:
-    while True:
-        sample_lanes_once()
-        time.sleep(IDLE_SAMPLE_SECONDS)
+    IDLE.sample_once(((url, lane_signal(url)) for url in watched_lanes()))
 
 
 def busy_lanes(provider, now: float | None = None) -> list[str]:
     """Return the provider's watched lanes active within its last idle_seconds."""
-    now = time.time() if now is None else now
-    with _idle_lock:
-        return [
-            url for url in provider.idle_metrics
-            if now - _lane_activity.get(url, {}).get("busy_at", 0.0) < provider.idle_seconds
-        ]
+    return IDLE.busy(provider, now)
 
 
 def busy_reason(provider) -> str | None:
-    busy = busy_lanes(provider)
-    if not busy:
-        return None
-    ports = ",".join(urllib.parse.urlsplit(url).netloc for url in busy)
-    return f"skipped: lanes busy ({ports}, idle {provider.idle_seconds:.0f}s required)"
+    return IDLE.reason(provider)
 
 
 def idle_snapshot() -> dict:
-    now = time.time()
-    snapshot = {}
-    for name in chain_providers():
-        provider = PROVIDERS[name]
-        if not provider.idle_metrics:
-            continue
-        with _idle_lock:
-            lanes = {
-                url: round(now - _lane_activity[url]["busy_at"], 1)
-                if url in _lane_activity and _lane_activity[url]["busy_at"] else None
-                for url in provider.idle_metrics
-            }
-        snapshot[name] = {
-            "idle_seconds_required": provider.idle_seconds,
-            "seconds_since_active": lanes,
-            "allowed": not busy_lanes(provider, now),
-        }
-    return snapshot
+    return IDLE.snapshot(PROVIDERS, chain_providers())
 
 
 def allowed_tiers(order: list[str] | None = None) -> tuple[list[str], dict[str, str]]:
@@ -368,12 +220,7 @@ def allowed_tiers(order: list[str] | None = None) -> tuple[list[str], dict[str, 
 
 def power_snapshot() -> dict:
     """Describe the power gate for /health, reusing the cached probe."""
-    source = power_source()
-    return {
-        "source": source,
-        "ac_only": [name for name in chain_providers() if PROVIDERS[name].ac_only],
-        "ac_only_allowed": source != "Battery Power",
-    }
+    return POWER.snapshot([name for name in chain_providers() if PROVIDERS[name].ac_only])
 
 
 # --- config -------------------------------------------------------------------
@@ -1575,7 +1422,7 @@ def main() -> None:
         f"power={power_source()} idle_gate={','.join(lanes) or 'off'}"
     )
     if lanes:
-        threading.Thread(target=_sample_lanes_forever, name="idle-sampler", daemon=True).start()
+        IDLE.start(lambda: ((url, lane_signal(url)) for url in watched_lanes()))
     server = ThreadingHTTPServer((HOST, PORT), RouterHandler)
     server.daemon_threads = True
     try:

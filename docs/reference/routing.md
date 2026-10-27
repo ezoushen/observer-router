@@ -16,6 +16,7 @@ What counts as an answer, what counts as a failed attempt, and how a streamed re
 - **A reply cut off at the token limit is a failure too.** See
   [below](#replies-cut-off-at-the-token-limit).
 - **Reasoning deltas are dropped.** Only `delta.content` is forwarded downstream.
+- **A reply from a rejected model is a failure too.** See [below](#rejected-models).
 - **A bridge instance authenticates to the bridge, not to the service behind it.** Point its
   `api_key_file` at the bridge's own env file (for cursor-api-proxy, `CURSOR_BRIDGE_API_KEY`),
   so the secret has one copy. A configured key source that yields no key fails the instance.
@@ -43,6 +44,38 @@ What counts as an answer, what counts as a failed attempt, and how a streamed re
   tier for other prompts.
 
 Raising the server's token cap is not the fix: a loop only runs longer.
+
+## Rejected models
+
+A provider that picks the model itself, such as `openrouter/free`, can land on one that cannot do
+the job: a safety classifier answers every prompt with `User Safety: safe`. A provider's
+`reject_models` lists model ids, matched exactly against the `model` the reply names. A reply from
+one of them is a failed attempt, like an empty one: it counts toward the provider's breaker, and
+the next tier answers. The check runs on the first frame that names the model, before any text
+reaches the client, so a rejected stream is closed without waiting for the rest of it. The rule
+names models, not content, so it holds for any client.
+
+## The request deadline
+
+A request has one deadline, `OBSERVER_REQUEST_DEADLINE_SECONDS` (85 s) after it arrived. A client
+stops waiting at some point, and a reply produced after that reaches no one while it holds the
+upstream, so the whole chain works inside the deadline:
+
+- **Each attempt gets what is left**, at most its `budget_s`, so time spent failing on earlier
+  tiers comes out of later ones.
+- **A provider is skipped** when less than its `min_budget_s` (default 1 s) is left. It is not
+  called, and the skip is not a breaker failure.
+- **Waiting for a `serial` lane counts.** A request waits for a lane held by another one only until
+  `min_budget_s` would be left, then moves on to the next tier; that skip is not a breaker failure
+  either.
+- **When no tier can answer in time**, the router returns its `502` with `attempted`, before the
+  client gives up, so claude-mem retries instead of timing out.
+
+The default sits under claude-mem's 90 s stream idle timeout, which counts from the request until
+the router's headers arrive. A buffered provider's `min_budget_s` is worth sizing from its typical
+whole-reply time: with less left, the reply would most likely be cut off by the deadline anyway.
+The `served` log line carries `latency`, from the answering tier's start, and `age`, from the
+request's arrival, which is what the client's timeout measures.
 
 ## Streaming contract
 

@@ -87,6 +87,8 @@ class _NullGuard:
     def __enter__(self): return self
     def __exit__(self, exc_type, exc_value, traceback):
         return False
+    def acquire(self, timeout: float = -1) -> bool: return True
+    def release(self) -> None: return None
 
 
 class LaneLocks:

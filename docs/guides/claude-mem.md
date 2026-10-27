@@ -29,7 +29,9 @@ at most 300 s. A streamed call is bound tighter by `CLAUDE_MEM_LLM_STREAM_IDLE_T
 by default, which runs from the moment the request is sent until the response headers arrive,
 and again between reads. The router withholds its headers until it commits, so every attempt
 before the one that answers counts against those 90 s: an answer that comes later than that
-reaches no one. `CLAUDE_MEM_API_TIMEOUT_MS` is unrelated; it bounds calls to claude-mem's own
+reaches no one. The router's [request deadline](../reference/routing.md#the-request-deadline),
+85 s by default, keeps the whole chain inside that window, and answers `502` in time when no tier
+can. `CLAUDE_MEM_API_TIMEOUT_MS` is unrelated; it bounds calls to claude-mem's own
 worker API. claude-mem asks for `max_tokens` 4096 (`CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS`) at
 temperature 0.3, and the router forwards both.
 

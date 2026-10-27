@@ -125,6 +125,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        self._arrived = time.time()  # the request deadline, and a served line's age, count from here
         if self._refuse_foreign_host():
             return
         if self.path.rstrip("/") != "/v1/chat/completions":
@@ -166,8 +167,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             )
 
         order = self.runtime.expand_chain()  # once per request: every expansion advances the group rotation
-        allowed, _ = self.runtime.allowed_tiers(order)
-        deadline = time.time() + sum(self.runtime.providers[name].budget for name in allowed) + 5.0
+        # One deadline for the whole chain: a reply later than the client waits reaches no one.
+        deadline = self._arrived + self.runtime.settings.request_deadline_seconds
         if body.get("stream"):
             self._stream(body, order, deadline)
         else:
@@ -219,7 +220,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self.runtime.ok(tier)
                 log(
                     f"served tier={tier} model={served} "
-                    f"latency={time.time() - started:.2f}s stream=1"
+                    f"latency={time.time() - started:.2f}s "
+                f"age={time.time() - self._arrived:.2f}s stream=1"
                 )
             except Exception as error:  # mid-stream failure: the connection is committed
                 log(f"tier {tier} failed mid-stream: {type(error).__name__}: {error}")
@@ -283,7 +285,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             self.runtime.ok(tier)
             log(
                 f"served tier={tier} model={served} "
-                f"latency={time.time() - started:.2f}s stream=0"
+                f"latency={time.time() - started:.2f}s "
+                f"age={time.time() - self._arrived:.2f}s stream=0"
             )
             self._json(200, {
                 "id": payload.get("id") or "chatcmpl-router",

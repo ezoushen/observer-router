@@ -138,8 +138,8 @@ class Runtime:
 
     def record_failure(self, tier: str, failure: TierFailure) -> None:
         """Record a failed attempt: a quota block, a breaker failure, or a group strike."""
-        if failure.partial:
-            return  # a cut-off depends on the prompt, not on the provider's health
+        if failure.partial or failure.skipped:
+            return  # a cut-off depends on the prompt, a skip on other requests: not on health
         if failure.retry_at:
             self.quota_exhausted(tier, failure.retry_at, failure.quota)
             return

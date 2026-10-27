@@ -7,6 +7,7 @@ import json
 import time
 import urllib.parse
 from collections.abc import Iterator
+from contextlib import contextmanager
 from io import BytesIO
 from urllib.error import HTTPError
 
@@ -169,6 +170,30 @@ def _budget_left(budget: float, deadline: float) -> float:
     return max(1.0, min(budget, deadline - time.time()))
 
 
+@contextmanager
+def _lane(provider: Provider, lanes: LaneLocks, deadline: float):
+    """Hold the provider's lane, waiting for it only while the request deadline still leaves the
+    provider its minimum budget; past that, the provider is skipped rather than failed."""
+    wait = deadline - time.time() - provider.min_budget
+    if wait < 0:
+        raise TierFailure(f"{provider.name}: skipped: under {provider.min_budget:g}s of the "
+                          "request deadline left", skipped=True)
+    lock = lanes.guard(provider)
+    if not lock.acquire(timeout=wait):
+        raise TierFailure(f"{provider.name}: skipped: lane still busy at the request deadline",
+                          skipped=True)
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _rejected(provider: Provider, model: str | None) -> TierFailure | None:
+    if model and model in provider.reject_models:
+        return TierFailure(f"{provider.name}: served by rejected model {model}")
+    return None
+
+
 def _reasoning_mode(provider: Provider) -> str | None:
     return "disabled" if provider.type == "openrouter" else None
 
@@ -183,7 +208,7 @@ def iter_stream(provider: Provider, body: dict, deadline: float,
     (finish_reason=length) fails over too; any other provider's cut-off reply raises only after
     its text was forwarded.
     """
-    with lanes.guard(provider):
+    with _lane(provider, lanes, deadline):
         yield from _iter_stream_locked(provider, body, deadline,
                                        _reasoning_mode(provider), lanes)
 
@@ -226,6 +251,9 @@ def _iter_stream_locked(provider, body, deadline, reasoning_mode,
             except ValueError:
                 continue
             served = served or chunk.get("model")
+            rejected = _rejected(provider, served)
+            if rejected:
+                raise rejected  # before any of its text is forwarded
             usage = chunk.get("usage") or usage
             choice = (chunk.get("choices") or [{}])[0]
             finish = choice.get("finish_reason") or finish
@@ -274,7 +302,7 @@ def _lines_until_content(provider: Provider, response, timeout: float, committed
 
 def nonstream(provider: Provider, body: dict, deadline: float, lanes: LaneLocks):
     """Return (response_dict, content) for a provider, or raise TierFailure."""
-    with lanes.guard(provider):
+    with _lane(provider, lanes, deadline):
         timeout = _budget_left(provider.budget, deadline)
         response = _open_with_reasoning_retry(provider, body, timeout, _reasoning_mode(provider))
         try:
@@ -286,6 +314,9 @@ def nonstream(provider: Provider, body: dict, deadline: float, lanes: LaneLocks)
             ) from error
         finally:
             response.close()
+    rejected = _rejected(provider, payload.get("model"))
+    if rejected:
+        raise rejected
     choice = (payload.get("choices") or [{}])[0]
     content = ((choice.get("message") or {}).get("content") or "").strip()
     if not content:

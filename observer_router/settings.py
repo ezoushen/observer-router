@@ -30,7 +30,8 @@ class Settings:
 
     Character counts bound a prompt; seconds are wall-clock intervals; `port` is the TCP port
     the HTTP surface binds and `allowed_hosts` the extra DNS names a request's Host header may
-    carry. `config_path` is the TOML file start-up reads.
+    carry. `config_path` is the TOML file start-up reads. `request_deadline_seconds` is how long
+    after its arrival a request may still be answered.
     """
 
     host: str
@@ -46,6 +47,7 @@ class Settings:
     power_cache_seconds: float
     idle_sample_seconds: float
     group_strikes: int
+    request_deadline_seconds: float
 
 
 def _bound(minimum: float, maximum: float) -> str:
@@ -121,5 +123,7 @@ def build_settings(environ: Mapping[str, str]) -> tuple[Settings, tuple[str, ...
                    errors),
         idle_sample_seconds=_float(environ, "OBSERVER_IDLE_SAMPLE_SECONDS", 2.0, 0.1, 3600.0, errors),
         group_strikes=_int(environ, "OBSERVER_GROUP_STRIKES", 2, 1, 1_000_000_000, errors),
+        request_deadline_seconds=_float(environ, "OBSERVER_REQUEST_DEADLINE_SECONDS", 85.0, 1.0,
+                                        math.inf, errors),
     )
     return settings, tuple(errors)

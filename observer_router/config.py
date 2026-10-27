@@ -32,6 +32,8 @@ _COMMON_FIELDS = {
     "type": "str", "url": "url", "model": "str", "budget_s": "seconds",
     "api_key_env": "name", "api_key_file": "str", "api_key_var": "name",
     "buffer_stream": "bool",
+    # Routing policy: served model ids whose reply fails over, and the least time worth calling for.
+    "reject_models": "strs", "min_budget_s": "seconds",
     # Per-provider overrides of router-wide settings; unset, the router-wide value applies.
     "max_prompt_chars": "count", "break_after": "count", "break_seconds": "seconds",
 }
@@ -75,6 +77,8 @@ class Provider:
     idle_metrics: tuple[str, ...] = ()
     idle_seconds: float = 30.0
     idle_signal: dict | None = None  # which /metrics names mean busy; None: the Splash counters
+    reject_models: tuple[str, ...] = ()  # served model ids whose reply counts as a failure
+    min_budget: float = 1.0  # less of the request deadline left than this: not called
 
 
 @dataclass(frozen=True)
@@ -108,6 +112,7 @@ def _check_field(where: str, field: str, kind: str, value) -> None:
                               and math.isfinite(v) and v > 0),
         "url": lambda v: isinstance(v, str) and _http_url(v),
         # The idle sampler reads plain http only.
+        "strs": lambda v: isinstance(v, list) and all(isinstance(s, str) and s for s in v),
         "urls": lambda v: isinstance(v, list) and all(
             isinstance(u, str) and _http_url(u) and u.startswith("http://") for u in v
         ),
@@ -117,6 +122,7 @@ def _check_field(where: str, field: str, kind: str, value) -> None:
             "str": "a string", "bool": "true or false", "count": "a whole number from 1", "table": "a table, e.g. {k = v}", "seconds": "a positive number",
             "name": "a variable name (letters, digits, underscore), not the key itself",
             "url": "an http(s) URL with a host", "urls": "a list of http:// URLs",
+            "strs": "a list of non-empty strings",
         }[kind]
         raise ConfigError(f"{where}: {field} must be {expected}")
 
@@ -139,7 +145,8 @@ def _provider(name: str, table, min_retained_chars: int) -> Provider:
         raise ConfigError(f"{where}: unknown field(s) for type {kind}: {', '.join(sorted(unknown))}")
     for key, value in table.items():
         _check_field(where, key, kinds[key], value)
-    fields = {key: value for key, value in table.items() if key != "budget_s"}
+    fields = {key: value for key, value in table.items()
+              if key not in ("budget_s", "min_budget_s")}
     fields["url"] = table.get("url") or _TYPE_DEFAULTS[kind]["url"]
     if not fields["url"]:
         raise ConfigError(f"{where}: type openai needs a url")
@@ -152,6 +159,8 @@ def _provider(name: str, table, min_retained_chars: int) -> Provider:
         raise ConfigError(f"{where}: type {kind} needs api_key_env or api_key_file")
     if "api_key_file" in fields:
         fields["api_key_file"] = os.path.expanduser(fields["api_key_file"])
+    if "reject_models" in fields:
+        fields["reject_models"] = tuple(fields["reject_models"])
     if "idle_metrics" in fields:
         fields["idle_metrics"] = tuple(str(url) for url in fields["idle_metrics"])
     if "idle_seconds" in fields:
@@ -169,7 +178,10 @@ def _provider(name: str, table, min_retained_chars: int) -> Provider:
         raise ConfigError(f"{where}: max_prompt_chars must be at least {floor}, enough to keep "
                           "a system message and the request")
     budget = float(table.get("budget_s", _TYPE_DEFAULTS[kind]["budget_s"]))
-    return Provider(name=name, budget=budget, **fields)
+    min_budget = float(table.get("min_budget_s", 1.0))
+    if "min_budget_s" in table and min_budget > budget:
+        raise ConfigError(f"{where}: min_budget_s must not exceed budget_s")
+    return Provider(name=name, budget=budget, min_budget=min_budget, **fields)
 
 
 _METRIC_NAME = re.compile(r"[A-Za-z_:][A-Za-z0-9_:]*")

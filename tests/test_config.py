@@ -96,6 +96,19 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(gemini.budget, 18.0)
         self.assertEqual(config.providers["local"].url, "http://127.0.0.1:1242/v1/chat/completions")
 
+    def test_a_reject_list_and_a_minimum_budget_are_read_for_any_type(self):
+        # Rule: both are per-provider routing policy, not GPU-lane gates, so a hosted type
+        # takes them too; unset, nothing is rejected and only the one-second floor applies.
+        config = _config('[providers.x]\ntype = "openrouter"\nmodel = "openrouter/free"\n'
+                         'api_key_env = "K"\nreject_models = ["a/safety:free"]\n'
+                         'min_budget_s = 5\n'
+                         '[providers.y]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\n')
+
+        self.assertEqual(config.providers["x"].reject_models, ("a/safety:free",))
+        self.assertEqual(config.providers["x"].min_budget, 5.0)
+        self.assertEqual(config.providers["y"].reject_models, ())
+        self.assertEqual(config.providers["y"].min_budget, 1.0)
+
     def test_chain_defaults_to_declaration_order(self):
         config = _config(TWO_GEMINIS.replace('chain = ["gemini-b", "gemini-a", "local"]', ""))
 
@@ -177,6 +190,17 @@ class ConfigTests(unittest.TestCase):
             "breaker seconds a string": ('[providers.x]\ntype = "gemini"\nmodel = "m"\n'
                                          'api_key_env = "K"\nbreak_seconds = "60"\n',
                                          "break_seconds must be"),
+            "reject list as a string": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
+                                        'model = "m"\nreject_models = "a/b"\n',
+                                        "reject_models must be"),
+            "reject list with an empty id": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
+                                             'model = "m"\nreject_models = [""]\n',
+                                             "reject_models must be"),
+            "minimum budget zero": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
+                                    'model = "m"\nmin_budget_s = 0\n', "min_budget_s must be"),
+            "minimum budget above the budget": (
+                '[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
+                'budget_s = 30\nmin_budget_s = 31\n', "min_budget_s must not exceed"),
             "gate on a remote type": (
                 '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\nserial = true\n',
                 "serial",

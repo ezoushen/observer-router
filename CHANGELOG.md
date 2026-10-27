@@ -4,6 +4,24 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-27 — one deadline per request, and rejected models
+
+### Added
+
+- **A request deadline, `OBSERVER_REQUEST_DEADLINE_SECONDS` (85 s)**, counted from the request's
+  arrival, replaces the sum of the allowed tiers' budgets plus 5 s (about 300 s on this chain).
+  Each attempt gets what is left of it, and when no tier can answer in time the `502` arrives
+  before claude-mem's 90 s stream idle timeout. On 2026-10-27 between 00h and 04h the local lane
+  served 111 replies after more than 90 s, which no client received.
+- **Waiting for a `serial` lane counts against the deadline.** The lane lock was taken with no
+  bound and outside any budget, so requests queued behind it for minutes. A request now waits
+  only until the provider's new `min_budget_s` (default 1 s) would be left, then moves on; a
+  skipped provider is not a breaker failure.
+- **`reject_models`**, per provider: a reply from a listed model fails over like an empty one,
+  checked before any text is forwarded. On 2026-10-27 `openrouter/free` routed 108 replies to
+  `nvidia/nemotron-3.5-content-safety:free`, and claude-mem rejected all 108 as prose.
+- **The `served` log line carries `age`**, the time since the request arrived, next to `latency`.
+
 ## 2026-10-27 — the router is a package
 
 ### Changed

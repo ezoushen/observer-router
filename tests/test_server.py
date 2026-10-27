@@ -451,6 +451,109 @@ class ChainTests(ServerTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(self._streamed_text(raw), "fallback")
 
+    def test_no_tier_starts_once_the_request_deadline_has_passed(self):
+        # Rule: a request has one deadline from its arrival; a reply after it reaches no client,
+        # so once a slow tier has used it up the chain ends with a 502 instead of trying on.
+        slow = self._upstream(body=completion("late"), delay=3)
+        fallback = self._upstream(body=completion("fallback"))
+        self._use({"slow": {"type": "openai", "url": slow.url, "model": "slow", "budget_s": 10},
+                   "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}},
+                  request_deadline_seconds=1.5)
+
+        started = time.time()
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
+
+        self.assertLess(time.time() - started, 2.5)
+        self.assertEqual(status, 502)
+        self.assertEqual(fallback.requests, [])
+        self.assertIn("deadline", json.loads(raw)["attempted"][1])
+        self.assertEqual(self._get_health()["breaker"]["fallback"]["failures"], 0)
+
+    def test_waiting_for_a_busy_serial_lane_counts_against_the_request_deadline(self):
+        # Rule: a serial lane held by another request is waited for only while the deadline
+        # leaves the provider time to run; then the chain moves on, and the wait is no fault of
+        # the provider.
+        lane = self._upstream(stream_pieces=[{"content": "lane"}])
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        self._use({"lane": {**LANE, "url": lane.url, "min_budget_s": 1.5},
+                   "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}},
+                  request_deadline_seconds=3)
+        held = self.server.runtime.lanes.guard(self.server.runtime.providers["lane"])
+        held.acquire()
+        try:
+            started = time.time()
+            status, raw = self._post({"messages": [{"role": "user", "content": "hi"}],
+                                      "stream": True})
+            elapsed = time.time() - started
+        finally:
+            held.release()
+
+        self.assertEqual(status, 200)
+        self.assertEqual(self._streamed_text(raw), "fallback")
+        self.assertEqual(lane.requests, [])
+        self.assertGreater(elapsed, 1.2)  # it waited for the lane until 1.5 s were left
+        self.assertLess(elapsed, 2.5)
+        self.assertEqual(self._get_health()["breaker"]["lane"]["failures"], 0)
+
+    def test_a_provider_is_skipped_when_less_than_its_minimum_budget_is_left(self):
+        # Rule: min_budget_s is the least time a provider can answer in; with less of the
+        # request deadline left it is not called at all.
+        lane = self._upstream(stream_pieces=[{"content": "lane"}])
+        fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+        self._use({"lane": {"type": "openai", "url": lane.url, "model": "lane",
+                            "min_budget_s": 5},
+                   "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}},
+                  request_deadline_seconds=3)
+
+        started = time.time()
+        status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertLess(time.time() - started, 1.0)
+        self.assertEqual(status, 200)
+        self.assertEqual(self._streamed_text(raw), "fallback")
+        self.assertEqual(lane.requests, [])
+
+    def test_a_reply_from_a_rejected_model_fails_over(self):
+        # Rule: a provider that routes to models itself (openrouter/free) can land on one that
+        # cannot do the job; a reply served by a model on its reject_models list fails over
+        # like an empty one, before anything reaches the client.
+        for stream in (True, False):
+            with self.subTest(stream=stream):
+                if stream:
+                    routed = self._upstream(stream_pieces=[{"content": "User Safety: safe"}])
+                    fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
+                else:
+                    routed = self._upstream(body=completion("User Safety: safe"))
+                    fallback = self._upstream(body=completion("fallback"))
+                self._use({"routed": {"type": "openai", "url": routed.url, "model": "auto",
+                                      "reject_models": ["fake"]},
+                           "fallback": {"type": "openai", "url": fallback.url,
+                                        "model": "fallback"}})
+
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    status, raw = self._post({"messages": [{"role": "user", "content": "hi"}],
+                                              "stream": stream})
+
+                self.assertEqual(status, 200)
+                text = (self._streamed_text(raw) if stream
+                        else json.loads(raw)["choices"][0]["message"]["content"])
+                self.assertEqual(text, "fallback")
+                self.assertEqual(len(routed.requests), 1)
+                self.assertIn("tier routed failed: routed: served by rejected model fake",
+                              out.getvalue())
+
+    def test_a_served_line_reports_the_requests_age(self):
+        # Rule: latency counts from the answering tier's start; age counts from the request's
+        # arrival, which is what a client's timeout measures.
+        upstream = self._upstream(stream_pieces=[{"content": "hi"}])
+        self._use({"x": {"type": "openai", "url": upstream.url, "model": "x"}})
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+        self.assertRegex(out.getvalue(),
+                         r"served tier=x model=fake latency=[\d.]+s age=[\d.]+s stream=1")
+
     def test_a_cut_off_reply_is_served_when_no_later_tier_answers(self):
         # Rule: a whole reply from a later tier wins, but a cut-off reply beats none at all:
         # claude-mem stores its complete blocks when told finish_reason=length.

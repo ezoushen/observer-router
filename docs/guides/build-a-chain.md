@@ -47,7 +47,9 @@ chain = ["local", "gemini-a", "openrouter"]
 ## Size the budgets
 
 The router waits up to each instance's `budget_s` in turn, so the budgets of the instances that
-can fail before the one that answers add up. Keep that sum under the client's deadline; for
-claude-mem, see [Use with claude-mem](claude-mem.md#timeouts). An instance with
+can fail before the one that answers add up. The [request deadline](../reference/routing.md#the-request-deadline)
+caps that sum: set `OBSERVER_REQUEST_DEADLINE_SECONDS` just under the client's own timeout, and an
+instance's `min_budget_s` to the least time it can answer in; for claude-mem, see
+[Use with claude-mem](claude-mem.md#timeouts). An instance with
 `buffer_stream = true` spends its budget on the whole reply, not just the first token
 ([routing](../reference/routing.md#buffered-streams)).

@@ -114,9 +114,9 @@ resident size after the probe, which understates Metal memory.
 
 | Candidate | Engine | Load s | Probe wall s | RSS MB | Outcome |
 | --- | --- | --- | --- | --- | --- |
-| qwen3.5-4b | `locals` | 4.6 | 5.3 | 1382 | loaded, `locals/qwen3.5-4b`, 32768 context |
-| gemma-4-e4b | `locals` | 10.7 | 6.9 | 1198 | loaded, `locals/gemma-4-e4b-it`, 32768 context |
-| qwen3.5-9b | `locals` | 6.1 | 17.9 | 1052 | loaded, `locals/qwen3.5-9b`, 32768 context |
+| qwen3.5-4b | `locals` | 4.6 | 5.1 | 1594 | loaded, `locals/qwen3.5-4b`, 32768 context |
+| gemma-4-e4b | `locals` | 6.2 | 6.3 | 4250 | loaded, `locals/gemma-4-e4b-it`, 32768 context |
+| qwen3.5-9b | `locals` | 6.1 | 13.5 | 2430 | loaded, `locals/qwen3.5-9b`, 32768 context |
 | lfm3-1.7b | `llama.cpp` | 1.7 | 3.6 | 1644 | loaded, thinking disabled |
 
 Three facts decided how LFM3 could be measured at all:
@@ -128,3 +128,30 @@ Three facts decided how LFM3 could be measured at all:
 - The chat template defaults to thinking, so the probe returned only `reasoning_content` and empty
   content. Passing `chat_template_kwargs: {enable_thinking: false}` gives a direct answer, which is
   the same condition the lane runs Qwen under (`enable_thinking = false`).
+
+### Baseline: today's lane
+
+Qwen3.5-4B, served on MBP-14 with the lane's flags, over the fixed sample. The sample's 36 observer
+rows all carry a stored observation in `tool_uses.observation_id`, so on this sample a skip is a missed
+signal rather than sensible noise filtering.
+
+| Measure | Result |
+| --- | --- |
+| observer replies accepted by the parser | 36/36 |
+| observer replies that skipped (`<skip_summary />`) | 25/36 (69%) |
+| observations produced | 11, all with every required field |
+| observations with an invented path | 1/11 (9%) |
+| replies truncated at the 2048-token cap | 0/36 |
+| observer whole-reply wall | p50 7.0 s, p90 16.0 s |
+| observer TTFT | p50 5.8 s |
+| prompt size | 9.2k-20.8k characters, median 12.4k |
+| summary cards passing `Oz` | 9/12 |
+| summary whole-reply wall | p50 3.1 s |
+| cold first-request TTFT (20.8k characters) | 10.6 s |
+| warm TTFT at the three largest prompts | 10.6 s, 12.2 s, 10.6 s |
+| decode | 51 tokens/s |
+
+The three failing summary cards are the two pinned ones and one live card carrying a single
+workstream: the zero-workstream card invents a workstream, the array-looking id card returns
+`workstreams` as something that is not an array, and the one-workstream card returns a set that is not
+"exactly once".

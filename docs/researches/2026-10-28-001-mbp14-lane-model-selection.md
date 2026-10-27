@@ -92,9 +92,16 @@ candidate identity is stripped and the order is randomized per sample.
 ### Speed
 
 Measured on MBP-14 with the lane's own flags (`--slots 1 --max-context 32768 --max-tokens 2048`): TTFT
-and decode rate at 2k, 8k and 24k-token prompts, whole-reply wall time over the sampled observer
-prompts, cold load time and peak memory. The envelope is the one that already governs the lane: a whole
-reply inside the router's 85 s request deadline and TTFT inside claude-mem's 90 s idle timeout.
+at the largest prompts the lane actually receives, decode rate on a 256-token generation, the first
+request after a load (which pays Metal kernel compilation), whole-reply wall time over the sampled
+observer prompts, cold load time and memory.
+
+The probe corrected an assumption: a single-turn prompt cannot be arbitrarily long. `HQ` elides a
+turn's fields to the context budget `L1` computes — 13,107 characters at 32,768 tokens — and the
+template adds roughly 9k more, so a production observer turn tops out around 22k characters. Prompts
+of 24k tokens never reach the lane through this path. The envelope is still the one that governs the
+lane: a whole reply inside the router's 85 s request deadline and TTFT inside claude-mem's 90 s idle
+timeout.
 
 ## Results
 

@@ -125,8 +125,9 @@ resident size after the probe, which understates Metal memory.
 | minicpm5-2b | `locals` | 6.1 | 7.4 | 1286 | loaded, `locals/minicpm5-2b`, 32768 context |
 | gemma-4-12b | `locals` | 12.2 | 24.0 | 477 | loaded, `locals/gemma-4-12b-it-optiq`, 32768 context |
 
-Every model that answered was served with the same flags, and its record carries the requested id, the
-id the server answered under, the argv and the seeds, so a record can always be traced to what ran.
+Every `locals` model answered under the same flags, and every record carries the requested id, the id
+the server answered under, the argv and the seeds, so a record can always be traced to what ran. LFM3
+is the exception the three facts below explain.
 Three facts decided how LFM3 could be measured at all:
 
 - The `b11935` release binary predates the architecture it needs: it rejects the GGUF with
@@ -215,7 +216,7 @@ faster model keeps the recall, and whether a larger Gemma is more faithful than 
 | Model | Missed known-worthy | Observations | Complete | Invented paths | Truncated | Wall p50 | Summary `Oz` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | minicpm5-2b | 0/36 | 34 | 100% | 41% | 0% | 4.6 s | 8/12 |
-| gemma-4-12b | 9/36 | 27 | 100% | 26% | 0% | 32.1 s | 10/12 |
+| gemma-4-12b | 9/36 | 27 | 100% | 26% | 0% | 42.4 s | 10/12 |
 
 - **MiniCPM5-2B is the fastest and the least accurate.** It never skips and answers with TTFT of
   0.4-0.7 s at 68 tokens/s, but 41% of its observations carry a path the input never contained, and
@@ -223,9 +224,9 @@ faster model keeps the recall, and whether a larger Gemma is more faithful than 
   as `<function name="shell">` tool calls instead of observations, which the stored replies show and
   the record counts only as `accepted: false`. Speed alone does not make it a successor.
 - **Gemma 4 12B is not better than the E4B at this work.** It skips more (9 against 4), invents more
-  (26% against 6%), passes fewer summaries (10 against 11), and is far slower: cold TTFT 37 s, warm
-  TTFT up to 43 s, decode 16.8 tokens/s. Its whole-reply times approach the router's 85 s deadline on
-  the largest prompts, so it would also compress the lane's headroom.
+  (26% against 6%), and passes fewer summaries (10 against 11). It is far slower too: cold TTFT 37 s,
+  warm TTFT up to 43 s, decode 16.8 tokens/s, and one observer reply took 77.7 s, which is 91% of the
+  router's 85 s deadline. It would leave the lane no headroom.
 
 ### Fidelity, preference and sampling noise
 
@@ -275,15 +276,16 @@ larger than sampling noise.
 What it costs:
 
 - Whole-reply p50 rises from 7.0 s to 13.1 s, p90 from 16.1 s to 19.9 s, and the tail reaches 41.5 s
-  (against today's 19.3 s maximum). These are model-server times: they exclude the serial-lane wait
-  production adds, so "inside the 85 s deadline" holds for an uncontended lane. Under `buffer_stream`
-  the whole reply must finish inside the budget, which makes the tail — not the p50 — the number that
-  decides fail-over.
-- `min_budget_s = 20` gates entry and lane waiting, and its comment cites a 20 s production median that
-  includes lane queueing, not this effort's 7.0 s server-side p50. With Gemma's p90 at 19.9 s and its
-  maximum at 41.5 s, 20 s admits replies that can outlast the allowance; sizing it from the p90 and
-  the observed tail (about 25 s, and no lower than the tail the lane will tolerate) is the config
-  change that keeps the skip decision honest, not a number this measurement alone settles.
+  (against today's 19.3 s maximum); a summary reply took 34.8 s. The rejected Gemma 4 12B reached
+  77.7 s on one observer reply.
+- These are model-server times: they exclude the serial-lane wait production adds, so "inside the
+  85 s deadline" holds for an uncontended lane. Under `buffer_stream` the whole reply must finish
+  inside the budget, which makes the tail — not the p50 — the number that decides fail-over.
+- `min_budget_s = 20` gates entry and lane waiting, and its comment cites a 20 s production median
+  that includes lane queueing, not this effort's 7.0 s server-side p50. With Gemma's p90 at 19.9 s
+  and its maximum at 41.5 s, 20 s admits replies that can outlast the allowance; sizing it from the
+  p90 and the observed tail (about 25 s, and no lower than the tail the lane will tolerate) is the
+  config change that keeps the skip decision honest, not a number this measurement alone settles.
 - Weights grow from 3.03 GB to 5.15 GB; both fit the 16 GB machine with 32k context, and Gemma loaded
   in 6.2 s.
 - The array-looking workstream id still defeats it, so that one card would still retry forever. A model

@@ -198,6 +198,9 @@ class ConfigTests(unittest.TestCase):
                                              "reject_models must be"),
             "minimum budget zero": ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\n'
                                     'model = "m"\nmin_budget_s = 0\n', "min_budget_s must be"),
+            "minimum budget under the one-second floor": (
+                '[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
+                'min_budget_s = 0.2\n', "min_budget_s must be at least 1"),
             "minimum budget above the budget": (
                 '[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
                 'budget_s = 30\nmin_budget_s = 31\n', "min_budget_s must not exceed"),

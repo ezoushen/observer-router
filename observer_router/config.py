@@ -179,6 +179,8 @@ def _provider(name: str, table, min_retained_chars: int) -> Provider:
                           "a system message and the request")
     budget = float(table.get("budget_s", _TYPE_DEFAULTS[kind]["budget_s"]))
     min_budget = float(table.get("min_budget_s", 1.0))
+    if min_budget < 1.0:  # every call gets at least a second, so less would overrun the deadline
+        raise ConfigError(f"{where}: min_budget_s must be at least 1")
     if "min_budget_s" in table and min_budget > budget:
         raise ConfigError(f"{where}: min_budget_s must not exceed budget_s")
     return Provider(name=name, budget=budget, min_budget=min_budget, **fields)

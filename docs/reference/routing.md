@@ -51,9 +51,11 @@ A provider that picks the model itself, such as `openrouter/free`, can land on o
 the job: a safety classifier answers every prompt with `User Safety: safe`. A provider's
 `reject_models` lists model ids, matched exactly against the `model` the reply names. A reply from
 one of them is a failed attempt, like an empty one: it counts toward the provider's breaker, and
-the next tier answers. The check runs on the first frame that names the model, before any text
-reaches the client, so a rejected stream is closed without waiting for the rest of it. The rule
-names models, not content, so it holds for any client.
+the next tier answers. The check runs on the first frame that names the model, so a rejected
+stream is closed without waiting for the rest of it; OpenRouter names it on every frame, so no
+text reaches the client first. A stream that names its model only after its first text has
+committed by then, and ends as a failed stream. The rule names models, not content, so it holds
+for any client.
 
 ## The request deadline
 

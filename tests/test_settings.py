@@ -80,6 +80,8 @@ class SettingsTests(unittest.TestCase):
         cases = {
             "not a number": ("OBSERVER_BREAK_AFTER", "three", "break_after", 3),
             "zero strikes": ("OBSERVER_GROUP_STRIKES", "0", "group_strikes", 2),
+            "deadline past a lock's longest wait": ("OBSERVER_REQUEST_DEADLINE_SECONDS", "1e10",
+                                                    "request_deadline_seconds", 85.0),
             "deadline under a second": ("OBSERVER_REQUEST_DEADLINE_SECONDS", "0.5",
                                         "request_deadline_seconds", 85.0),
             "negative seconds": ("OBSERVER_BREAK_SECONDS", "-1", "break_seconds", 60.0),

@@ -44,7 +44,7 @@ ac_only = true
 | `ac_only` | `openai` | `false` | Skip while on battery |
 | `buffer_stream` | all | `false` | Hold a stream back until it ends, so a reply cut off at the token limit fails over |
 | `reject_models` | all | none | Model ids, as the reply names them, whose reply fails over like an empty one ([rejected models](routing.md#rejected-models)) |
-| `min_budget_s` | all | `1`, at most `budget_s` | Least time worth calling this provider for: with less of the [request deadline](routing.md#the-request-deadline) left it is skipped, and a `serial` lane is waited for only until then |
+| `min_budget_s` | all | `1`; from 1 to `budget_s` | Least time worth calling this provider for: with less of the [request deadline](routing.md#the-request-deadline) left it is skipped, and a `serial` lane is waited for only until then |
 | `idle_metrics`, `idle_seconds` | `openai` | none, `30` | Wait for these lanes to be idle first |
 | `idle_signal` | `openai` | Splash's request counters | Which `/metrics` names mean the lane is busy, as counters or gauges ([naming the metrics](gates.md#naming-the-metrics)); needs `idle_metrics` |
 | `max_prompt_chars` | all | router-wide `OBSERVER_MAX_PROMPT_CHARS` | Fold the prompt to this many characters for this provider only; can only tighten the router-wide guard ([sizing](prompt-guard.md#sizing-a-limit-for-one-provider)) |
@@ -94,7 +94,7 @@ Integer settings stop at 1,000,000,000.
 | `OBSERVER_ROUTER_HOST` / `OBSERVER_ROUTER_PORT` | `127.0.0.1` / `1244` | an address / an integer 1–65535 |
 | `OBSERVER_ROUTER_ALLOWED_HOSTS` | none | comma-separated DNS names, besides `localhost` and IP literals, accepted in a request's `Host` header; see [security](security.md) |
 | `OBSERVER_BREAK_AFTER` / `OBSERVER_BREAK_SECONDS` | `3` / `60` | an integer ≥ 1 / seconds ≥ 1 |
-| `OBSERVER_REQUEST_DEADLINE_SECONDS` | `85` | seconds ≥ 1: how long after its arrival a request may still be answered ([request deadline](routing.md#the-request-deadline)) |
+| `OBSERVER_REQUEST_DEADLINE_SECONDS` | `85` | seconds, 1–86400: how long after its arrival a request may still be answered ([request deadline](routing.md#the-request-deadline)) |
 | `OBSERVER_GROUP_STRIKES` | `2` | an integer ≥ 1: group members failing in a row, by timeout or unexplained 429, that block the group |
 | `OBSERVER_POWER_CACHE_SECONDS` | `30` | seconds ≥ 0 |
 | `OBSERVER_IDLE_SAMPLE_SECONDS` | `2` | seconds, 0.1–3600 |

@@ -221,7 +221,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 log(
                     f"served tier={tier} model={served} "
                     f"latency={time.time() - started:.2f}s "
-                f"age={time.time() - self._arrived:.2f}s stream=1"
+                    f"age={time.time() - self._arrived:.2f}s stream=1"
                 )
             except Exception as error:  # mid-stream failure: the connection is committed
                 log(f"tier {tier} failed mid-stream: {type(error).__name__}: {error}")

@@ -123,7 +123,8 @@ def build_settings(environ: Mapping[str, str]) -> tuple[Settings, tuple[str, ...
                    errors),
         idle_sample_seconds=_float(environ, "OBSERVER_IDLE_SAMPLE_SECONDS", 2.0, 0.1, 3600.0, errors),
         group_strikes=_int(environ, "OBSERVER_GROUP_STRIKES", 2, 1, 1_000_000_000, errors),
+        # A day at most: a serial lane's lock cannot wait past threading.TIMEOUT_MAX.
         request_deadline_seconds=_float(environ, "OBSERVER_REQUEST_DEADLINE_SECONDS", 85.0, 1.0,
-                                        math.inf, errors),
+                                        86_400.0, errors),
     )
     return settings, tuple(errors)

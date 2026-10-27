@@ -67,8 +67,8 @@ roughly 7 GB.
 | --- | --- | --- | --- |
 | Qwen3.5-4B (today) | `mlx-community/Qwen3.5-4B-MLX-4bit` | 2.9 GB | `locals` |
 | Gemma 4 E4B | `mlx-community/gemma-4-e4b-it-4bit` | 5.15 GB | `locals` |
-| Qwen3.5-9B | `mlx-community/Qwen3.5-9B-MLX-4bit` | ~5.9 GB | `locals` |
-| LFM3-1.7B | `LiquidAI/LFM3-1.7B` (GGUF `Q4_K_M`) | ~1.1 GB | `llama.cpp` `b11935` |
+| Qwen3.5-9B | `mlx-community/Qwen3.5-9B-MLX-4bit` | 5.35 GB | `locals` |
+| LFM3-1.7B | `LiquidAI/LFM3-1.7B` (GGUF `Q4_K_M`) | 1.1 GB | `llama.cpp` built `19ff817` |
 | Qwen3.5-4B OptiQ | `mlx-community/Qwen3.5-4B-OptiQ-4bit` | 2.9 GB | `locals` |
 | Gemma 4 12B OptiQ | `mlx-community/gemma-4-12B-it-OptiQ-4bit` | ~6.7 GB | `locals` |
 | MiniCPM5-2B | `mlx-community/MiniCPM5-2B-mlx-4Bit` | 1.3 GB | `locals` |
@@ -95,3 +95,29 @@ Measured on MBP-14 with the lane's own flags (`--slots 1 --max-context 32768 --m
 and decode rate at 2k, 8k and 24k-token prompts, whole-reply wall time over the sampled observer
 prompts, cold load time and peak memory. The envelope is the one that already governs the lane: a whole
 reply inside the router's 85 s request deadline and TTFT inside claude-mem's 90 s idle timeout.
+
+## Results
+
+### What loads on the target
+
+Every candidate was served alone on a spare port on MBP-14, with the lane's own flags
+(`--slots 1 --max-context 32768 --max-tokens 2048`), and probed with a real observer request built by
+the harness. Load time is from process start to `/v1/models` answering; RSS is the server process's
+resident size after the probe, which understates Metal memory.
+
+| Candidate | Engine | Load s | Probe wall s | RSS MB | Outcome |
+| --- | --- | --- | --- | --- | --- |
+| qwen3.5-4b | `locals` | 4.6 | 5.3 | 1382 | loaded, `locals/qwen3.5-4b`, 32768 context |
+| gemma-4-e4b | `locals` | 10.7 | 6.9 | 1198 | loaded, `locals/gemma-4-e4b-it`, 32768 context |
+| qwen3.5-9b | `locals` | 6.1 | 17.9 | 1052 | loaded, `locals/qwen3.5-9b`, 32768 context |
+| lfm3-1.7b | `llama.cpp` | 1.7 | 3.6 | 1644 | loaded, thinking disabled |
+
+Three facts decided how LFM3 could be measured at all:
+
+- The `b11935` release binary predates the architecture it needs: it rejects the GGUF with
+  `unknown model architecture: 'lfm3'`, although llama.cpp merged LFM3 support on 2026-10-27.
+- Building llama.cpp's source at `19ff817fb25e` (Metal enabled, cmake from a private venv) produces a
+  `llama-server` that loads the model; nothing was installed system-wide.
+- The chat template defaults to thinking, so the probe returned only `reasoning_content` and empty
+  content. Passing `chat_template_kwargs: {enable_thinking: false}` gives a direct answer, which is
+  the same condition the lane runs Qwen under (`enable_thinking = false`).

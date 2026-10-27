@@ -118,8 +118,12 @@ resident size after the probe, which understates Metal memory.
 | gemma-4-e4b | `locals` | 6.2 | 6.3 | 4250 | loaded, `locals/gemma-4-e4b-it`, 32768 context |
 | qwen3.5-9b | `locals` | 6.1 | 13.5 | 2430 | loaded, `locals/qwen3.5-9b`, 32768 context |
 | lfm3-1.7b | `llama.cpp` | 1.7 | 3.6 | 1644 | loaded, thinking disabled |
+| minicpm5-2b | `locals` | 6.1 | 7.4 | 1286 | loaded, `locals/minicpm5-2b`, 32768 context |
+| gemma-4-12b | `locals` | 12.2 | 24.0 | 477 | loaded, `locals/gemma-4-12b-it-optiq`, 32768 context |
 
-Three facts decided how LFM3 could be measured at all:
+Every model that answered was served with the same flags, and its record carries the requested id, the
+id the server answered under, the argv and the seeds, so a record can always be traced to what ran.
+Six facts decided how the candidates could be measured at all, three of them about LFM3:
 
 - The `b11935` release binary predates the architecture it needs: it rejects the GGUF with
   `unknown model architecture: 'lfm3'`, although llama.cpp merged LFM3 support on 2026-10-27.
@@ -160,3 +164,56 @@ The three failing summary cards are the two pinned ones and one live card carryi
 workstream: the zero-workstream card invents a workstream, the array-looking id card returns
 `workstreams` as something that is not an array, and the one-workstream card returns a set that is not
 "exactly once".
+
+### The core candidates
+
+Each candidate was measured on the baseline's own 36 observer rows and 12 summary cards, at the same
+temperatures, token caps and seeds, served alone on its own port with the lane's flags.
+
+| Model | Missed known-worthy | Observations | Complete | Invented paths | Truncated | Wall p50 | Wall p90 | TTFT p50 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| qwen3.5-4b (today) | 25/36 | 11 | 100% | 9% | 0% | 7.0 s | 16.1 s | 5.8 s |
+| gemma-4-e4b | 4/36 | 32 | 100% | 6% | 0% | 13.1 s | 19.9 s | 5.7 s |
+| qwen3.5-9b | 29/36 | 7 | 100% | 0% | 0% | 15.0 s | 32.2 s | 13.6 s |
+| lfm3-1.7b | 10/36 | 41 | 73% | 22% | 5.6% | 9.2 s | 25.2 s | 3.0 s |
+
+| Model | Summary `Oz` pass | Workstream ids exact | Summary wall p50 | Cold TTFT | Warm TTFT | Decode |
+| --- | --- | --- | --- | --- | --- | --- |
+| qwen3.5-4b (today) | 9/12 | 9/9 accepted | 3.1 s | 10.6 s | 10.6 s | 55 tok/s |
+| gemma-4-e4b | 11/12 | 11/11 accepted | 4.2 s | 7.9 s | 7.9-20.8 s | 43 tok/s |
+| qwen3.5-9b | 11/12 | 11/11 accepted | 6.5 s | 25.8 s | 20.0-22.8 s | 16 tok/s |
+| lfm3-1.7b | 0/12 | — | 3.6 s | — | 0.6-0.8 s | 96 tok/s |
+
+What the counters say:
+
+- **Gemma 4 E4B recovers signal the lane drops.** It skips 4 of the 36 rows production judged worth
+  an observation, against today's 25, writes every observation with every required field, and keeps
+  invented paths at 6% of observations. It also passes the zero-workstream summary card that stalls
+  today's lane; only the array-looking-id card still defeats it. Its cost is latency: whole-reply p50
+  13.1 s against 7.0 s, still well inside the 85 s deadline.
+- **Qwen3.5-9B is worse at this job than the smaller sibling.** It skips 29 of 36 known-worthy rows,
+  and it is slow: decode 16 tokens/s against 55, warm TTFT around 20 s on 20.8k-character prompts.
+  Scale did not buy recall here.
+- **LFM3-1.7B is the fastest and the least faithful.** It prefills 20.8k characters in under a second
+  and decodes at 96 tokens/s, but it records almost everything: 41 observations from 36 rows, 22% of
+  them carrying a path the input never contained, 27% missing a required field, and two replies cut off
+  at the 4096-token cap (one produced 13 observations in one reply). Its `json_object` summaries are
+  valid JSON but invent workstream ids on every card, so it fails all 12.
+
+### The extension candidates
+
+Two more were measured because the core comparison left two live questions: whether a much smaller,
+faster model keeps the recall, and whether a larger Gemma is more faithful than the E4B.
+
+| Model | Missed known-worthy | Observations | Complete | Invented paths | Truncated | Wall p50 | Summary `Oz` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| minicpm5-2b | 0/36 | 34 | 100% | 41% | 0% | 4.6 s | 8/12 |
+| gemma-4-12b | 9/36 | 27 | 100% | 26% | 0% | 32.1 s | 10/12 |
+
+- **MiniCPM5-2B is the fastest and the least accurate.** It never skips and answers with TTFT of
+  0.4-0.7 s at 68 tokens/s, but 41% of its observations carry a path the input never contained, and
+  two of its twelve summaries fail on shape. Speed alone does not make it a successor.
+- **Gemma 4 12B is not better than the E4B at this work.** It skips more (9 against 4), invents more
+  (26% against 6%), passes fewer summaries (10 against 11), and is far slower: cold TTFT 37 s, warm
+  TTFT up to 43 s, decode 16.8 tokens/s. Its whole-reply times approach the router's 85 s deadline on
+  the largest prompts, so it would also compress the lane's headroom.

@@ -95,6 +95,14 @@ class SettingsTests(unittest.TestCase):
                 self.assertIn(name, errors[0])
                 self.assertEqual(getattr(settings, attribute), default)
 
+    def test_an_empty_host_is_kept_as_the_empty_address(self):
+        # Rule: like the config path, an empty OBSERVER_ROUTER_HOST keeps the empty address
+        # instead of the default (as before the split).
+        settings, errors = build_settings({"OBSERVER_ROUTER_HOST": ""})
+
+        self.assertEqual(errors, ())
+        self.assertEqual(settings.host, "")
+
     def test_an_empty_config_path_is_not_the_default(self):
         # Rule: only an absent OBSERVER_ROUTER_CONFIG takes the default; an empty one is the empty
         # path, which start-up reports as unreadable (as before the split).

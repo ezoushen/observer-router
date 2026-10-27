@@ -123,7 +123,7 @@ resident size after the probe, which understates Metal memory.
 
 Every model that answered was served with the same flags, and its record carries the requested id, the
 id the server answered under, the argv and the seeds, so a record can always be traced to what ran.
-Six facts decided how the candidates could be measured at all, three of them about LFM3:
+Three facts decided how LFM3 could be measured at all:
 
 - The `b11935` release binary predates the architecture it needs: it rejects the GGUF with
   `unknown model architecture: 'lfm3'`, although llama.cpp merged LFM3 support on 2026-10-27.

@@ -62,6 +62,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 from datetime import datetime, timedelta
@@ -89,6 +90,8 @@ from observer_router.idle import (
 )
 from observer_router.idle import parse_lane_metrics as _parse_lane_metrics
 from observer_router.power import PowerGate, probe_power
+from observer_router.prompt import PromptGuard, PromptLimits
+from observer_router.prompt import message_chars as _message_chars_of
 from observer_router.settings import build_settings
 
 LOG_PREFIX = "[observer-router]"
@@ -274,200 +277,31 @@ def expand_chain() -> list[str]:
 
 # --- prompt safety ------------------------------------------------------------
 
-_DATA_URL = re.compile(r"data:image/[^;,\s]+;base64,[^\s\"']+", re.IGNORECASE)
-_BASE64_BLOB = re.compile(
-    rf"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{{{BASE64_BLOB_CHARS},}}={{0,2}}"
-    rf"(?![A-Za-z0-9+/=])"
+GUARD = PromptGuard(
+    PromptLimits(SETTINGS.max_prompt_chars, SETTINGS.max_field_chars,
+                 SETTINGS.min_retained_chars, SETTINGS.base64_blob_chars),
+    log,
 )
-_compaction_lock = threading.Lock()
-_compaction_totals = {
-    "compacted_requests": 0,
-    "input_chars": 0,
-    "output_chars": 0,
-    "dropped_messages": 0,
-    "removed_image_parts": 0,
-    "removed_blobs": 0,
-}
-
-
-def _content_chars(content) -> int:
-    if isinstance(content, str):
-        return len(content)
-    if isinstance(content, list):
-        return sum(_content_chars(item) for item in content)
-    if isinstance(content, dict):
-        return sum(len(str(key)) + _content_chars(value) for key, value in content.items())
-    return len(str(content)) if content is not None else 0
 
 
 def _message_chars(messages: list[dict]) -> int:
-    return sum(_content_chars(message.get("content")) for message in messages)
-
-
-def _fold_text(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    if limit <= 0:
-        return ""
-    marker = "\n[... content folded by observer-router ...]\n"
-    if len(marker) >= limit:
-        return marker[:limit]
-    available = limit - len(marker)
-    head = max(1, available * 3 // 5)
-    tail = available - head
-    return text[:head] + marker + (text[-tail:] if tail else "")
-
-
-def _clean_text(text: str, stats: dict) -> str:
-    def omit_data_url(match: re.Match) -> str:
-        stats["removed_blobs"] += 1
-        return f"[image binary payload omitted: {len(match.group(0)):,} chars]"
-
-    def omit_blob(match: re.Match) -> str:
-        stats["removed_blobs"] += 1
-        return f"[binary payload omitted: {len(match.group(0)):,} chars]"
-
-    cleaned = _DATA_URL.sub(omit_data_url, text)
-    cleaned = _BASE64_BLOB.sub(omit_blob, cleaned)
-    if len(cleaned) > MAX_FIELD_CHARS:
-        stats["folded_fields"] += 1
-        cleaned = _fold_text(cleaned, MAX_FIELD_CHARS)
-    return cleaned
-
-
-def _clean_content(content, stats: dict) -> str:
-    if isinstance(content, str):
-        return _clean_text(content, stats)
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") in {
-                "image",
-                "image_url",
-                "input_image",
-            }:
-                stats["removed_image_parts"] += 1
-                parts.append("[image omitted from observer prompt]")
-            elif isinstance(item, dict) and item.get("type") in {"text", "input_text"}:
-                parts.append(_clean_text(str(item.get("text") or ""), stats))
-            else:
-                parts.append(_clean_text(json.dumps(item, ensure_ascii=False), stats))
-        return "\n".join(part for part in parts if part)
-    if isinstance(content, dict):
-        if content.get("type") in {"image", "image_url", "input_image"}:
-            stats["removed_image_parts"] += 1
-            return "[image omitted from observer prompt]"
-        return _clean_text(json.dumps(content, ensure_ascii=False), stats)
-    return _clean_text(str(content), stats) if content is not None else ""
+    return _message_chars_of(messages)
 
 
 def compact_messages(messages: list[dict], limit: int | None = None) -> tuple[list[dict], dict]:
-    """Return a bounded conversation while preserving system and newest context.
-
-    limit is the character budget; by default the router-wide OBSERVER_MAX_PROMPT_CHARS.
-    """
-    limit = MAX_PROMPT_CHARS if limit is None else limit
-    stats = {
-        "changed": False,
-        "input_chars": _message_chars(messages),
-        "output_chars": 0,
-        "dropped_messages": 0,
-        "folded_fields": 0,
-        "removed_image_parts": 0,
-        "removed_blobs": 0,
-    }
-    sanitized = []
-    for message in messages:
-        if not isinstance(message, dict):
-            stats["dropped_messages"] += 1
-            continue
-        cleaned = dict(message)
-        cleaned["content"] = _clean_content(message.get("content"), stats)
-        sanitized.append(cleaned)
-
-    if _message_chars(sanitized) <= limit:
-        stats["output_chars"] = _message_chars(sanitized)
-        stats["changed"] = sanitized != messages
-        return sanitized, stats
-
-    system_indexes = [
-        index for index, message in enumerate(sanitized) if message.get("role") == "system"
-    ]
-    recent_indexes = [
-        index for index in reversed(range(len(sanitized))) if index not in system_indexes
-    ]
-    # Give the primary system contract and newest non-system message first claim on the
-    # budget; processing every system message first could otherwise discard the request
-    # that the observer is meant to answer.
-    priority = system_indexes[:1] + recent_indexes[:1] + system_indexes[1:] + recent_indexes[1:]
-    selected = {}
-    remaining = limit
-    # The newest non-system message is the request the model must answer, so an oversized
-    # system message may not take the whole budget: up to half is held back for it.
-    newest = recent_indexes[0] if recent_indexes else None
-    reserved = 0
-    if newest is not None and system_indexes:
-        reserved = min(_content_chars(sanitized[newest].get("content")), remaining // 2)
-    for index in priority:
-        message = dict(sanitized[index])
-        size = _content_chars(message.get("content"))
-        if index == newest:
-            reserved = 0
-        available = remaining - reserved
-        if size <= available:
-            selected[index] = message
-            remaining -= size
-        elif available >= MIN_RETAINED_CHARS:
-            message["content"] = _fold_text(str(message.get("content") or ""), available)
-            selected[index] = message
-            stats["folded_fields"] += 1
-            remaining -= available
-
-    compacted = [selected[index] for index in sorted(selected)]
-    stats["dropped_messages"] += len(sanitized) - len(selected)
-    stats["output_chars"] = _message_chars(compacted)
-    stats["changed"] = True
-    return compacted, stats
+    return GUARD.compact(messages, limit)
 
 
 def fit_prompt(provider: Provider, body: dict) -> dict:
-    """Return the request body sized for this provider: its max_prompt_chars can only tighten the
-    router-wide guard, which has already run, so a provider without one gets the body as is."""
-    limit = provider.max_prompt_chars
-    messages = body.get("messages") or []
-    if not limit or _message_chars(messages) <= limit:
-        return body
-    compacted, stats = compact_messages(messages, limit)
-    log(
-        f"compacted prompt for tier {provider.name} chars={stats['input_chars']}->"
-        f"{stats['output_chars']} dropped_messages={stats['dropped_messages']} "
-        f"folded_fields={stats['folded_fields']}"
-    )
-    return {**body, "messages": compacted}
+    return GUARD.fit(provider, body)
 
 
 def record_compaction(stats: dict) -> None:
-    if not stats["changed"]:
-        return
-    with _compaction_lock:
-        _compaction_totals["compacted_requests"] += 1
-        for key in (
-            "input_chars",
-            "output_chars",
-            "dropped_messages",
-            "removed_image_parts",
-            "removed_blobs",
-        ):
-            _compaction_totals[key] += stats[key]
+    GUARD.record(stats)
 
 
 def compaction_snapshot() -> dict:
-    with _compaction_lock:
-        return {
-            "max_prompt_chars": MAX_PROMPT_CHARS,
-            "max_field_chars": MAX_FIELD_CHARS,
-            **_compaction_totals,
-        }
+    return GUARD.snapshot()
 
 
 # --- breakers and quota blocks ------------------------------------------------
@@ -557,24 +391,32 @@ def payload_for(provider: Provider, body: dict, reasoning_mode: str | None) -> d
 _QUOTED_VALUE = re.compile(r"""(["'])(.*)\1\s*(?:#.*)?""")
 
 
-def _key_from_file(path: str, var: str) -> str:
+def _key_from_file(provider: Provider, path: str, var: str) -> str:
     """Read one key from a dotenv-style file, or from a JSON object when the path ends .json.
 
     Reading the key where it already lives (a bridge's env file, claude-mem's settings) keeps
     one copy of the secret, so rotating it there cannot silently break the provider. The file
     is re-read on every call, so a rotation takes effect without a restart.
     """
-    with open(path) as handle:
-        if path.endswith(".json"):
-            value = json.load(handle).get(var)  # top-level keys only
-            return str(value).strip() if value else ""
-        found = ""
-        for line in handle:  # the last assignment wins, as when the file is sourced
-            name, sep, value = line.strip().removeprefix("export ").partition("=")
-            if not sep or name.strip() != var:
-                continue
-            quoted = _QUOTED_VALUE.fullmatch(value.strip())
-            found = quoted.group(2) if quoted else value.split(" #", 1)[0].strip()
+    found = ""
+    try:
+        with open(path) as handle:
+            if path.endswith(".json"):
+                value = json.load(handle).get(var)  # top-level keys only
+                return str(value).strip() if value else ""
+            for line in handle:  # the last assignment wins, as when the file is sourced
+                name, sep, value = line.strip().removeprefix("export ").partition("=")
+                if not sep or name.strip() != var:
+                    continue
+                quoted = _QUOTED_VALUE.fullmatch(value.strip())
+                found = quoted.group(2) if quoted else value.split(" #", 1)[0].strip()
+    except OSError as error:
+        raise TierFailure(f"{provider.name}: cannot read {path}: {error.strerror}") from None
+    except (ValueError, AttributeError) as error:
+        # The decoder's message is not echoed: it can quote the file's contents.
+        raise TierFailure(
+            f"{provider.name}: cannot parse {path}: {type(error).__name__}"
+        ) from None
     return found
 
 
@@ -585,16 +427,7 @@ def api_key(provider: Provider) -> str:
         if key:
             return key
     if provider.api_key_file:
-        path = provider.api_key_file
-        try:
-            return _key_from_file(path, provider.api_key_var)
-        except OSError as error:
-            raise TierFailure(f"{provider.name}: cannot read {path}: {error.strerror}") from None
-        except (ValueError, AttributeError) as error:
-            # The decoder's message is not echoed: it can quote the file's contents.
-            raise TierFailure(
-                f"{provider.name}: cannot parse {path}: {type(error).__name__}"
-            ) from None
+        return _key_from_file(provider, provider.api_key_file, provider.api_key_var)
     return ""
 
 
@@ -776,7 +609,7 @@ def _reasoning_mode(provider: Provider) -> str | None:
     return "disabled" if provider.type == "openrouter" else None
 
 
-def iter_stream(provider: Provider, body: dict, deadline: float):
+def iter_stream(provider: Provider, body: dict, deadline: float) -> Iterator[tuple[str, str]]:
     """Yield ('meta', served_model) once, then ('delta', text) frames.
 
     Raises TierFailure when the provider produces no content or errors before the first
@@ -789,7 +622,7 @@ def iter_stream(provider: Provider, body: dict, deadline: float):
         yield from _iter_stream_locked(provider, body, deadline, _reasoning_mode(provider))
 
 
-def _iter_stream_locked(provider, body, deadline, reasoning_mode):
+def _iter_stream_locked(provider, body, deadline, reasoning_mode) -> Iterator[tuple[str, str]]:
     timeout = _budget_left(provider.budget, deadline)
     # A buffered reply reaches the client only once it is whole, so the budget to first content
     # covers all of it: each read may wait only for what is left of it.
@@ -852,7 +685,7 @@ def _iter_stream_locked(provider, body, deadline, reasoning_mode):
         yield ("delta", "".join(pieces))
 
 
-def _lines_until_content(provider: Provider, response, timeout: float, committed):
+def _lines_until_content(provider: Provider, response, timeout: float, committed) -> Iterator[bytes]:
     """Yield the response's lines. A read error before the stream commits -- an upstream that
     sent its headers and then stalled -- becomes a TierFailure, so the chain can still fail over;
     after it, the error propagates to the committed stream's handler."""

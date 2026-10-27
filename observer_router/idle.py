@@ -85,7 +85,8 @@ def read_lane(url: str, signal: dict | None = None) -> tuple[int | None, int] | 
 
 class _NullGuard:
     def __enter__(self): return self
-    def __exit__(self, *a): return False
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
 
 
 class LaneLocks:

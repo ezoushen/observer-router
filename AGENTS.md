@@ -35,8 +35,9 @@ Exercise one provider in isolation with a throwaway router on another port whose
 
 | Path | Contents |
 | --- | --- |
-| `observer-router.py` | The router. Single file, no third-party imports. |
-| `test_observer_router.py` | Tests for config loading, request building, chain failover over HTTP, cut-off replies and buffered streams, group blocks, compaction, the power and idle gates, and quota blocks. |
+| `observer-router.py` | The launchd entry point: imports the package and calls `main()`. |
+| `observer_router/` | The router, one module per concern: `settings`, `config`, `power`, `idle`, `breakers`, `prompt`, `providers`, `upstream`, `runtime`, `server`, `app`. Standard library only. |
+| `tests/` | Tests per module, driven through each module's interface; `tests/support.py` holds the fake upstream and the runtime helpers. |
 | `docslint.py` | Checks the Markdown against the style rules below and that relative links resolve. Standard library only. |
 | `test_docslint.py` | Tests for `docslint.py`, and the check of this repository's own documentation. |
 | `config.example.toml` | The documented config template. The live config is `~/.config/observer-router/config.toml`, outside the repository. |
@@ -62,7 +63,7 @@ Exercise one provider in isolation with a throwaway router on another port whose
   `config.example.toml`.
 - Machine-specific values (URLs, model ids, key locations) belong in the local config file, not
   in code defaults or the committed example.
-- New behaviour needs a test in `test_observer_router.py`.
+- New behaviour needs a test beside the module it exercises, in `tests/`.
 
 ## Documentation conventions
 

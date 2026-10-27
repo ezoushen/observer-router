@@ -24,10 +24,10 @@ OBSERVER_ROUTER_PORT=12944 OBSERVER_ROUTER_CHAIN=<provider-name> python3 observe
 python3 -m unittest -v
 ```
 
-The suite runs `test_observer_router.py` and `test_docslint.py`, and needs nothing installed.
+The suite runs the `tests/` package and `test_docslint.py`, and needs nothing installed.
 `test_docslint.py` checks these documents against the style rules in `AGENTS.md` and that their
-links resolve; `python3 docslint.py` runs that check alone. `test_observer_router.py` drives the
-real HTTP handler against fake upstreams. It covers:
+links resolve; `python3 docslint.py` runs that check alone. `tests/` drives the real HTTP handler
+against fake upstreams and builds its own runtime per case. It covers:
 
 - config loading and validation: named instances, type defaults, groups and their rotation, the
   chain and its override, and rejection of inline keys, unknown fields, undefined names, and

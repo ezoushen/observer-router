@@ -4,6 +4,23 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-27 — the router is a package
+
+### Changed
+
+- **`observer-router.py` is a thin entry point over `observer_router/`.** The 1,939-line file is
+  split by concern: `settings` (environment knobs), `config` (the TOML schema), `power` and
+  `idle` (the GPU-lane gates), `breakers` (failures, quota blocks, group strikes), `prompt` (the
+  deterministic guard), `providers` (request rewriting) and `upstream` (the HTTP call). `runtime`
+  owns the chain and all mutable state, `server` the HTTP surface, `app` start-up. Nothing about
+  the HTTP API, the config schema or the environment knobs changed.
+- **Tests are split per module.** `test_observer_router.py` is gone; `tests/` holds one file per
+  module, driven through each module's interface, with the fake upstream and runtime helpers in
+  `tests/support.py`. `python3 -m unittest -v` still runs everything.
+- **Mutable state lives in one `Runtime`.** The module globals that `configure()` filled are gone;
+  a test builds its own runtime, so two tests share no providers, breakers or samples. The
+  power probe, lane fetch and clock are injected.
+
 ## 2026-10-27 — standard-library documentation check
 
 ### Changed

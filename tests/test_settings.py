@@ -30,7 +30,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(errors, ())
 
     def test_values_are_read_from_the_environment(self):
-        # Rule: each variable sets its knob, and an empty value means "use the default".
+        # Rule: each variable sets its knob; an empty numeric knob uses its default (the two
+        # path/address variables that keep an empty value are covered below).
         settings, errors = build_settings({
             "OBSERVER_ROUTER_HOST": "127.0.0.2",
             "OBSERVER_ROUTER_PORT": "1300",

@@ -65,6 +65,9 @@ class MetricParsingTests(unittest.TestCase):
                 gauge = f'vllm:num_requests_running {value}\nvllm:num_requests_waiting 0\n'
                 self.assertIsNone(parse_lane_metrics(gauge, VLLM_SIGNAL))
 
+    def test_a_missing_named_gauge_is_unreadable(self):
+        self.assertIsNone(parse_lane_metrics("vllm:num_requests_running 0\n", VLLM_SIGNAL))
+
     def test_counters_can_be_named(self):
         text = "lane_started_total 50\nlane_done_total 40\nlane_err_total 3\n"
 
@@ -115,6 +118,16 @@ class IdleMonitorTests(unittest.TestCase):
         monitor.record(URL, None, now=1_010.0)
 
         self.assertEqual(monitor.busy(_provider(), now=1_031.0), [])
+
+    def test_a_gauge_lane_is_busy_only_while_something_is_in_flight(self):
+        # Rule: with no submitted counter, in-flight work is the only activity; a lane at zero
+        # is idle once the grace period has passed.
+        monitor = self.monitor()
+        monitor.record(URL, (None, 1), now=1_000.0)
+        self.assertEqual(monitor.busy(_provider(), now=1_029.0), [URL])
+
+        monitor.record(URL, (None, 0), now=1_010.0)
+        self.assertEqual(monitor.busy(_provider(), now=1_040.0), [])
 
     def test_the_reason_names_the_lane_and_the_grace(self):
         monitor = self.monitor()

@@ -2,7 +2,8 @@
 
 A value that is not a number, or out of range, is collected as an error naming its variable and
 the knob keeps its default; start-up reports the errors and exits. An empty value means "unset",
-as a launchd plist leaves a variable it does not want to set.
+as a launchd plist leaves a variable it does not want to set, except `OBSERVER_ROUTER_CONFIG` and
+`OBSERVER_ROUTER_HOST`: empty keeps the empty path or address, as before the split.
 
 The defaults are complete, so the router starts with no environment and no installation.
 """

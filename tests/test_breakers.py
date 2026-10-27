@@ -87,6 +87,11 @@ class QuotaResetTests(unittest.TestCase):
     def test_an_unreadable_body_states_no_quota(self):
         self.assertIsNone(quota_reset("gemini", 429, None, "not json", now=NOW))
 
+    def test_a_provider_type_without_a_parser_states_no_reset(self):
+        self.assertIsNone(quota_reset("cursor", 429, None,
+                                      _gemini_429(["GenerateRequestsPerDayPerProjectPerModel"]),
+                                      now=NOW))
+
     def test_an_unreadable_or_past_reset_is_not_trusted(self):
         # Rule: a header that is not a number, or names an epoch already passed, states no
         # usable reset.

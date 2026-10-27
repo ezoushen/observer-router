@@ -94,6 +94,14 @@ class SettingsTests(unittest.TestCase):
                 self.assertIn(name, errors[0])
                 self.assertEqual(getattr(settings, attribute), default)
 
+    def test_an_empty_config_path_is_not_the_default(self):
+        # Rule: only an absent OBSERVER_ROUTER_CONFIG takes the default; an empty one is the empty
+        # path, which start-up reports as unreadable (as before the split).
+        settings, errors = build_settings({"OBSERVER_ROUTER_CONFIG": ""})
+
+        self.assertEqual(errors, ())
+        self.assertEqual(settings.config_path, "")
+
     def test_an_invalid_allowed_host_name_is_refused_whole(self):
         # Rule: one bad entry rejects the list rather than silently serving no names or a typo.
         settings, errors = build_settings({"OBSERVER_ROUTER_ALLOWED_HOSTS": "ok.lan,bad host"})

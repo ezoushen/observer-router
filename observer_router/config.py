@@ -50,10 +50,6 @@ class ConfigError(Exception):
     """The config file is missing, unreadable, or describes an unusable chain."""
 
 
-# Provider fields that override a router-wide setting; /health shows the ones that are set.
-OVERRIDE_FIELDS = ("max_prompt_chars", "break_after", "break_seconds")
-
-
 @dataclass(frozen=True)
 class Provider:
     """One named upstream instance. Several instances may share a type."""

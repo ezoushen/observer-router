@@ -78,9 +78,11 @@ in this repository.
 
 ## Environment
 
-Environment overrides, all optional. An unset or empty variable takes the default. A value that is
-not a number, or is out of range, stops the router at start-up with the variable named in the
-log (exit status 2), as an invalid config file does; it never falls back to the default silently.
+Environment overrides, all optional. An unset or empty variable takes the default, except
+`OBSERVER_ROUTER_CONFIG` and `OBSERVER_ROUTER_HOST`: empty keeps the empty path or address, and an
+empty config path stops start-up with `cannot read config`. A value that is not a number, or is out
+of range, stops the router at start-up with the variable named in the log (exit status 2), as an
+invalid config file does; it never falls back to the default silently.
 Integer settings stop at 1,000,000,000.
 
 | Variable | Default | Accepts |

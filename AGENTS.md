@@ -36,7 +36,7 @@ Exercise one provider in isolation with a throwaway router on another port whose
 | Path | Contents |
 | --- | --- |
 | `observer-router.py` | The launchd entry point: imports the package and calls `main()`. |
-| `observer_router/` | The router, one module per concern: `settings`, `config`, `power`, `idle`, `breakers`, `prompt`, `providers`, `upstream`, `runtime`, `server`, `app`. Standard library only. |
+| `observer_router/` | The router, one module per concern: `settings`, `config`, `power`, `idle`, `breakers`, `prompt`, `providers`, `upstream`, `runtime`, `server`, `app`, plus `failure` and `log`. Standard library only. |
 | `tests/` | Tests per module, driven through each module's interface; `tests/support.py` holds the fake upstream and the runtime helpers. |
 | `docslint.py` | Checks the Markdown against the style rules below and that relative links resolve. Standard library only. |
 | `test_docslint.py` | Tests for `docslint.py`, and the check of this repository's own documentation. |

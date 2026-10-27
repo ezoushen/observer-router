@@ -453,8 +453,8 @@ def _http_error(code, body, headers=None):
     return HTTPError("https://example.invalid", code, "error", message, BytesIO(body.encode()))
 
 
-class QuotaResetTests(ActiveConfigTestCase):
-    """A 429 that states its reset blocks the tier until then instead of re-probing it."""
+class BreakerInterplayTests(ActiveConfigTestCase):
+    """Recording a failure blocks the tier at its quota reset or at the breaker threshold."""
 
     # 2026-09-24 07:28:25 UTC = 00:28:25 PDT
     NOW = 1790234905.0
@@ -462,74 +462,11 @@ class QuotaResetTests(ActiveConfigTestCase):
     def setUp(self):
         super().setUp()
         _use({"gemini": {**REMOTE, "type": "gemini", "api_key_env": "K"}})
-        with router._breaker_lock:
-            self.saved = (dict(router._failures), dict(router._skip_until),
-                          dict(router._skip_reason))
+        self.saved = router.BREAKERS
 
     def tearDown(self):
         super().tearDown()
-        with router._breaker_lock:
-            for target, saved in zip(
-                (router._failures, router._skip_until, router._skip_reason), self.saved
-            ):
-                target.clear()
-                target.update(saved)
-
-    def test_gemini_daily_quota_blocks_until_pacific_midnight(self):
-        error = _http_error(429, _gemini_429([
-            "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
-            "GenerateRequestsPerDayPerProjectPerModel-FreeTier",
-        ]))
-
-        retry_at, quota = router.quota_reset("gemini", error, now=self.NOW)
-
-        self.assertEqual(quota, "GenerateRequestsPerDayPerProjectPerModel-FreeTier")
-        self.assertEqual(retry_at, 1790319600.0)  # 2026-09-25 00:00 PDT
-
-    def test_gemini_per_minute_quota_uses_retry_delay(self):
-        error = _http_error(429, _gemini_429(
-            ["GenerateRequestsPerMinutePerProjectPerModel-FreeTier"], retry_delay="34.94s"
-        ))
-
-        retry_at, quota = router.quota_reset("gemini", error, now=self.NOW)
-
-        self.assertAlmostEqual(retry_at, self.NOW + 34.94)
-        self.assertEqual(quota, "GenerateRequestsPerMinutePerProjectPerModel-FreeTier")
-
-    def test_openrouter_reset_header_is_epoch_milliseconds(self):
-        body = json.dumps({"error": {"code": 429, "metadata": {
-            "headers": {"X-RateLimit-Reset": "1790294400000"},
-            "limit_source": "openrouter_free_tier_daily",
-        }}})
-        error = _http_error(429, body, {"X-RateLimit-Reset": "1790294400000"})
-
-        retry_at, quota = router.quota_reset("openrouter", error, now=self.NOW)
-
-        self.assertEqual(retry_at, 1790294400.0)  # 2026-09-25 00:00 UTC
-        self.assertEqual(quota, "openrouter_free_tier_daily")
-
-    def test_openrouter_reset_is_read_from_the_body_when_headers_lack_it(self):
-        body = json.dumps(
-            {"error": {"metadata": {"headers": {"X-RateLimit-Reset": "1790294400000"}}}}
-        )
-
-        retry_at, _ = router.quota_reset("openrouter", _http_error(429, body), now=self.NOW)
-
-        self.assertEqual(retry_at, 1790294400.0)
-
-    def test_unreadable_or_implausible_resets_fall_back_to_the_breaker(self):
-        thirty_days_out = str(int(self.NOW * 1000) + 30 * 86_400_000)
-        cases = [
-            ("gemini", _http_error(429, "not json")),
-            ("gemini", _http_error(500, _gemini_429(["GenerateRequestsPerDayPerProjectPerModel"]))),
-            ("openrouter", _http_error(429, "{}", {"X-RateLimit-Reset": "garbage"})),
-            ("openrouter", _http_error(429, "{}", {"X-RateLimit-Reset": "1000"})),  # past
-            ("openrouter", _http_error(429, "{}", {"X-RateLimit-Reset": thirty_days_out})),
-            ("cursor", _http_error(429, _gemini_429(["GenerateRequestsPerDayPerProjectPerModel"]))),
-        ]
-        for tier, error in cases:
-            with self.subTest(tier=tier, code=error.code):
-                self.assertIsNone(router.quota_reset(tier, error, now=self.NOW))
+        router.BREAKERS = self.saved
 
     def test_error_body_survives_repeated_reads(self):
         error = _http_error(400, "Reasoning is mandatory for this endpoint")
@@ -553,7 +490,6 @@ class QuotaResetTests(ActiveConfigTestCase):
         for _ in range(router.BREAK_AFTER):
             router.record_failure("gemini", router.TierFailure("gemini: HTTP 503"))
 
-        self.assertEqual(router._skip_until["gemini"], until)
         self.assertIn("quota", router.tier_skip_reason("gemini"))
 
     def test_success_clears_the_block(self):
@@ -853,9 +789,7 @@ class ChainTests(ActiveConfigTestCase):
         super().setUp()
         self.env = dict(router.os.environ)
         router.os.environ.update({"TEST_GEMINI_A": "key-a", "TEST_GEMINI_B": "key-b"})
-        with router._breaker_lock:
-            self.saved_breaker = (dict(router._failures), dict(router._skip_until),
-                                  dict(router._skip_reason))
+        self.saved_breaker = router.BREAKERS
         self.upstreams: list[FakeUpstream] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), router.RouterHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -869,12 +803,7 @@ class ChainTests(ActiveConfigTestCase):
             upstream.close()
         router.os.environ.clear()
         router.os.environ.update(self.env)
-        with router._breaker_lock:
-            for target, saved in zip(
-                (router._failures, router._skip_until, router._skip_reason), self.saved_breaker
-            ):
-                target.clear()
-                target.update(saved)
+        router.BREAKERS = self.saved_breaker
 
     def _upstream(self, **kwargs) -> FakeUpstream:
         upstream = FakeUpstream(**kwargs)

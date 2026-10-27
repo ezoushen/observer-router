@@ -81,6 +81,7 @@ from observer_router.config import (
     provider_warnings,
     stale_environment,
 )
+from observer_router.breakers import Breakers, quota_reset
 from observer_router.idle import (
     IdleMonitor,
     LaneLocks,
@@ -236,14 +237,14 @@ _rotation: dict[str, int] = {}
 
 
 def configure(config: Config, chain: tuple[str, ...] | None = None) -> None:
-    global PROVIDERS, GROUPS, CHAIN
+    global PROVIDERS, GROUPS, CHAIN, BREAKERS
     PROVIDERS = dict(config.providers)
     GROUPS = dict(config.groups)
     CHAIN = tuple(chain or config.chain)
     with _rotation_lock:
         _rotation.clear()
-    with _breaker_lock:
-        _group_strikes.clear()
+    BREAKERS = Breakers(GROUPS, PROVIDERS, BREAK_AFTER, BREAK_SECONDS,
+                        GROUP_STRIKES_TO_BLOCK, log)
 
 
 def chain_providers() -> list[str]:
@@ -469,179 +470,34 @@ def compaction_snapshot() -> dict:
         }
 
 
-# --- circuit breaker ----------------------------------------------------------
+# --- breakers and quota blocks ------------------------------------------------
 
-_breaker_lock = threading.Lock()
-# Keyed by provider name, so two instances of one type break and block independently.
-_failures: dict[str, int] = {}
-_skip_until: dict[str, float] = {}
-# Why a provider is skipped: "breaker-open", or the quota the provider says is exhausted.
-_skip_reason: dict[str, str] = {}
+BREAKERS = Breakers({}, {}, BREAK_AFTER, BREAK_SECONDS, SETTINGS.group_strikes, log)
 
 
 def tier_skip_reason(name: str) -> str | None:
     """Return why the tier is skipped right now, or None when it may run."""
-    with _breaker_lock:
-        if time.time() >= _skip_until.get(name, 0.0):
-            return None
-        return _skip_reason.get(name) or "breaker-open"
+    return BREAKERS.skip_reason(name)
 
 
 def tier_available(name: str) -> bool:
-    return tier_skip_reason(name) is None
+    return BREAKERS.available(name)
 
 
 def tier_ok(name: str) -> None:
-    group = _group_of(name)
-    with _breaker_lock:
-        if group:
-            _group_strikes[group] = 0
-        _failures[name] = 0
-        _skip_until[name] = 0.0
-        _skip_reason[name] = ""
-
-
-def _skip(name: str, until: float, reason: str) -> bool:
-    """Extend a tier's skip; return False when a longer skip already covers it.
-
-    A request in flight when a quota block opened can still fail afterwards, and its 60 s
-    breaker must not cut the block short.
-    """
-    if until <= _skip_until.get(name, 0.0):
-        return False
-    _skip_until[name] = until
-    _skip_reason[name] = reason
-    return True
-
-
-def _break_after(name: str) -> int:
-    provider = PROVIDERS.get(name)
-    return (provider.break_after if provider else 0) or BREAK_AFTER
-
-
-def _break_seconds(name: str) -> float:
-    provider = PROVIDERS.get(name)
-    return (provider.break_seconds if provider else 0.0) or BREAK_SECONDS
+    BREAKERS.ok(name)
 
 
 def tier_failed(name: str, reason: str) -> None:
-    seconds = _break_seconds(name)
-    with _breaker_lock:
-        _failures[name] = _failures.get(name, 0) + 1
-        if _failures[name] >= _break_after(name) and _skip(
-            name, time.time() + seconds, "breaker-open"
-        ):
-            log(
-                f"tier {name} breaker open for {seconds:.0f}s "
-                f"after {_failures[name]} failures ({reason})"
-            )
+    BREAKERS.failed(name, reason)
 
 
 def tier_quota_exhausted(name: str, until: float, quota: str) -> None:
-    """Skip a tier until the provider's stated quota reset instead of re-probing it."""
-    with _breaker_lock:
-        _failures[name] = _failures.get(name, 0) + 1
-        stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(until))
-        reason = f"quota {quota} until {stamp}"
-        if _skip(name, until, reason):
-            log(f"tier {name} {reason} (in {(until - time.time()) / 3600:.1f}h)")
+    BREAKERS.quota_exhausted(name, until, quota)
 
 
 def breaker_snapshot() -> dict:
-    with _breaker_lock:
-        now = time.time()
-        return {
-            name: {
-                "failures": _failures.get(name, 0),
-                "skipped_for_s": round(max(0.0, _skip_until.get(name, 0.0) - now), 1),
-                "reason": _skip_reason.get(name, "") if _skip_until.get(name, 0.0) > now else "",
-            }
-            for name in chain_providers()
-        }
-
-
-# --- provider quota signals -----------------------------------------------------
-
-# A reset further out than this is treated as unreadable rather than trusted: a malformed
-# header must not take a tier offline for days.
-MAX_QUOTA_BLOCK_SECONDS = 26 * 3600
-# Gemini's daily quotas reset at midnight Pacific time.
-GEMINI_QUOTA_TZ = ZoneInfo("America/Los_Angeles")
-
-
-def _next_pacific_midnight(now: float) -> float:
-    local = datetime.fromtimestamp(now, GEMINI_QUOTA_TZ)
-    midnight = datetime(local.year, local.month, local.day, tzinfo=GEMINI_QUOTA_TZ)
-    return (midnight + timedelta(days=1)).timestamp()
-
-
-def _duration_seconds(text) -> float | None:
-    """Parse a protobuf Duration string such as "34s" or "34.94s"."""
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)s\s*", str(text or ""))
-    return float(match.group(1)) if match else None
-
-
-def _gemini_quota(body: str, now: float) -> tuple[float, str] | None:
-    """Read QuotaFailure and RetryInfo from a Gemini 429 body.
-
-    RetryInfo's retryDelay is a per-minute hint that Google sends even when a per-day quota
-    is the one exhausted, so any PerDay violation wins and blocks until the daily reset.
-    """
-    try:
-        payload = json.loads(body)
-    except ValueError:
-        return None
-    if isinstance(payload, list):
-        payload = payload[0] if payload else {}
-    details = ((payload or {}).get("error") or {}).get("details") or []
-    quota_ids, retry_delay = [], None
-    for detail in details:
-        kind = str(detail.get("@type", ""))
-        if kind.endswith("google.rpc.QuotaFailure"):
-            quota_ids += [str(v.get("quotaId", "")) for v in detail.get("violations") or []]
-        elif kind.endswith("google.rpc.RetryInfo"):
-            retry_delay = _duration_seconds(detail.get("retryDelay"))
-    daily = [quota for quota in quota_ids if "PerDay" in quota]
-    if daily:
-        return _next_pacific_midnight(now), daily[0]
-    if retry_delay is not None:
-        return now + retry_delay, quota_ids[0] if quota_ids else "retryDelay"
-    return None
-
-
-def _openrouter_quota(headers, body: str) -> tuple[float, str] | None:
-    """Read X-RateLimit-Reset (epoch milliseconds) from the headers or the body's copy."""
-    reset = headers.get("X-RateLimit-Reset") if headers is not None else None
-    source = ""
-    try:
-        metadata = (json.loads(body).get("error") or {}).get("metadata") or {}
-        reset = reset or (metadata.get("headers") or {}).get("X-RateLimit-Reset")
-        source = str(metadata.get("limit_source") or "")
-    except (ValueError, AttributeError):
-        pass
-    if reset is None:
-        return None
-    try:
-        return float(reset) / 1000.0, source or "X-RateLimit-Reset"
-    except (TypeError, ValueError):
-        return None
-
-
-def quota_reset(kind: str, error: HTTPError, now: float | None = None) -> tuple[float, str] | None:
-    """Return (reset_epoch, quota_name) when a 429 from a provider of this type states its reset."""
-    if error.code != 429:
-        return None
-    now = time.time() if now is None else now
-    body = _error_body(error)
-    if kind == "gemini":
-        found = _gemini_quota(body, now)
-    elif kind == "openrouter":
-        found = _openrouter_quota(error.headers, body)
-    else:
-        found = None
-    if not found or not now < found[0] <= now + MAX_QUOTA_BLOCK_SECONDS:
-        return None
-    return found
+    return BREAKERS.snapshot(chain_providers())
 
 
 # --- tier requests ------------------------------------------------------------
@@ -864,7 +720,7 @@ def _snippet(error: HTTPError) -> str:
 
 
 def _http_failure(provider: Provider, error: HTTPError) -> TierFailure:
-    quota = quota_reset(provider.type, error)
+    quota = quota_reset(provider.type, error.code, error.headers, _error_body(error))
     name = provider.name
     if quota:
         retry_at, quota_name = quota
@@ -1069,46 +925,29 @@ def record_failure(tier: str, failure: TierFailure) -> None:
         tier_quota_exhausted(tier, failure.retry_at, failure.quota)
         return
     tier_failed(tier, str(failure))
-    group = _group_of(tier)
+    group = BREAKERS.group_of(tier)
     if group is None or not failure.overloaded:
         return
     if failure.overloaded in ("timeout", "exhausted"):
         # One timeout is ordinary tail latency (a budget sits near the p99), and one unexplained
         # 429 can be one key; two members failing so in a row, with no success between, is the
         # model.
-        with _breaker_lock:
-            _group_strikes[group] = _group_strikes.get(group, 0) + 1
-            if _group_strikes[group] < GROUP_STRIKES_TO_BLOCK:
-                return
-            _group_strikes[group] = 0
-    group_overloaded(group, str(failure))
+        if not BREAKERS.strike(group):
+            return
+    BREAKERS.group_overloaded(group, str(failure))
 
 
 # Consecutive member timeouts or unexplained 429s, per group, that block the group; any member's
 # success resets it.
 GROUP_STRIKES_TO_BLOCK = SETTINGS.group_strikes
-_group_strikes: dict[str, int] = {}
 
 
 def _group_of(tier: str) -> str | None:
-    return next((name for name, members in GROUPS.items() if tier in members), None)
+    return BREAKERS.group_of(tier)
 
 
 def group_overloaded(group: str, reason: str) -> None:
-    """Skip every member of the group for its own break interval (BREAK_SECONDS by default).
-
-    The members are keys for one model, so a model that is out of capacity fails them all; trying
-    each in turn only spends every member's budget before the chain moves on. A quota block
-    already in place is kept (_skip never shortens one).
-    """
-    now = time.time()
-    note = f"group {group} overloaded ({reason[:120]})"
-    with _breaker_lock:
-        blocked = [member for member in GROUPS[group]
-                   if _skip(member, now + _break_seconds(member), note)]
-    if blocked:
-        skipped = ",".join(f"{member}({_break_seconds(member):.0f}s)" for member in blocked)
-        log(f"group {group} overloaded: skipping {skipped}")
+    BREAKERS.group_overloaded(group, reason)
 
 
 # --- HTTP surface --------------------------------------------------------------

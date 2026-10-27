@@ -11,7 +11,6 @@ from observer_router.config import Provider
 from observer_router.failure import TierFailure
 from observer_router.idle import LaneLocks
 from observer_router.upstream import iter_stream, nonstream
-
 from tests.support import FakeUpstream, completion
 
 

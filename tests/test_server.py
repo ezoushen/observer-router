@@ -1,173 +1,25 @@
-#!/usr/bin/env python3
-"""Contract tests for observer-router: prompt compaction, the power and idle gates, the cursor
-tier, and quota-reset blocks."""
+"""The HTTP surface: the host and content-type guards, and failover across the chain."""
 
 import contextlib
 import http.client
-import importlib.util
 import io
 import json
+import os
 import socket
-import sys
-import tempfile
 import threading
 import time
 import unittest
 import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from typing import Any
+from dataclasses import replace
 from urllib.error import HTTPError
 
-from observer_router.settings import build_settings
-
-from tests.support import FakeUpstream, completion
-
-
-MODULE_PATH = Path(__file__).with_name("observer-router.py")
-SPEC = importlib.util.spec_from_file_location("observer_router_legacy", MODULE_PATH)
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError(f"cannot load {MODULE_PATH}")
-router: Any = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = router  # dataclasses resolve annotations through sys.modules
-SPEC.loader.exec_module(router)
-
-
-def _config(text: str) -> Any:
-    """Parse a TOML config through the public loader, via a temporary file."""
-    with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / "config.toml"
-        path.write_text(text)
-        return router.load_config(str(path))
-
-
-POOL = """
-chain = ["pool", "local"]
-
-[providers.a]
-type = "openai"
-url = "http://127.0.0.1:9/a"
-model = "m"
-
-[providers.b]
-type = "openai"
-url = "http://127.0.0.1:9/b"
-model = "m"
-
-[providers.c]
-type = "openai"
-url = "http://127.0.0.1:9/c"
-model = "m"
-
-[providers.local]
-type = "openai"
-url = "http://127.0.0.1:9/local"
-model = "m"
-
-[groups.pool]
-members = ["a", "b", "c"]
-"""
-
-
-class GroupRotationTests(unittest.TestCase):
-    """A group starts each request one member further on, so its keys share the load."""
-
-    def test_a_group_rotates_its_members_across_requests(self):
-        config = _config(POOL)
-        router.configure(config)
-        try:
-            orders = [router.expand_chain() for _ in range(4)]
-        finally:
-            router.configure(router.Config({}, ()))
-
-        self.assertEqual(config.chain, ("pool", "local"))
-        self.assertEqual(config.groups["pool"], ("a", "b", "c"))
-        self.assertEqual(orders, [
-            ["a", "b", "c", "local"],
-            ["b", "c", "a", "local"],
-            ["c", "a", "b", "local"],
-            ["a", "b", "c", "local"],
-        ])
-
-
-def _use(tables: dict, chain=None) -> None:
-    """Make these provider tables the router's active configuration."""
-    config = router.parse_config({"providers": tables})
-    router.configure(config, tuple(chain) if chain else None)
+from observer_router.prompt import message_chars
+from observer_router.server import serve
+from tests.support import FakeUpstream, completion, make_runtime, make_settings
 
 
 REMOTE = {"type": "openai", "url": "http://127.0.0.1:9/v1/chat/completions", "model": "r"}
 LANE = {**REMOTE, "model": "lane", "serial": True, "ac_only": True}
-
-
-class ActiveConfigTestCase(unittest.TestCase):
-    """Restores the active configuration after each test."""
-
-    def setUp(self):
-        self.saved_config = (router.PROVIDERS, router.CHAIN, router.GROUPS)
-
-    def tearDown(self):
-        router.PROVIDERS, router.CHAIN, router.GROUPS = self.saved_config
-
-
-class PowerGateTests(ActiveConfigTestCase):
-    """A GPU lane marked ac_only is left out while on battery; other providers still run.
-
-    The gate is pinned through its probe, so the tests never shell out to pmset.
-    """
-
-    def setUp(self):
-        super().setUp()
-        _use({"remote": REMOTE, "local": LANE})
-        self.saved_power = router.POWER
-
-    def tearDown(self):
-        super().tearDown()
-        router.POWER = self.saved_power
-
-    def _pin_power(self, source: str) -> None:
-        router.POWER = router.PowerGate(lambda: source, cache_seconds=30.0)
-
-    def test_ac_only_provider_runs_on_ac_power(self):
-        self._pin_power("AC Power")
-
-        allowed, skipped = router.allowed_tiers()
-
-        self.assertEqual(allowed, ["remote", "local"])
-        self.assertEqual(skipped, {})
-
-    def test_ac_only_provider_is_skipped_on_battery_with_a_reason(self):
-        self._pin_power("Battery Power")
-
-        allowed, skipped = router.allowed_tiers()
-
-        self.assertEqual(allowed, ["remote"])
-        self.assertIn("battery", skipped["local"])
-
-    def test_unreadable_power_state_keeps_the_provider(self):
-        self._pin_power("unknown")
-
-        allowed, _ = router.allowed_tiers()
-
-        self.assertIn("local", allowed)
-
-    def test_a_provider_without_ac_only_runs_on_battery(self):
-        _use({"remote": REMOTE, "local": {**LANE, "ac_only": False}})
-        self._pin_power("Battery Power")
-
-        allowed, skipped = router.allowed_tiers()
-
-        self.assertEqual(allowed, ["remote", "local"])
-        self.assertEqual(skipped, {})
-
-    def test_snapshot_reports_the_gate(self):
-        self._pin_power("Battery Power")
-
-        snapshot = router.power_snapshot()
-
-        self.assertEqual(snapshot["source"], "Battery Power")
-        self.assertEqual(snapshot["ac_only"], ["local"])
-        self.assertFalse(snapshot["ac_only_allowed"])
 
 
 def _gemini_429(quota_ids, retry_delay="34s"):
@@ -176,122 +28,55 @@ def _gemini_429(quota_ids, retry_delay="34s"):
         {"@type": "type.googleapis.com/google.rpc.Help", "links": []},
         {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [
             {"quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests",
-             "quotaId": quota_id} for quota_id in quota_ids
-        ]},
+             "quotaId": quota_id} for quota_id in quota_ids]},
         {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay},
-    ]}}], indent=2)
+    ]}}])
 
 
-class BreakerInterplayTests(ActiveConfigTestCase):
-    """Recording a failure blocks the tier at its quota reset or at the breaker threshold."""
-
-    # 2026-09-24 07:28:25 UTC = 00:28:25 PDT
-    NOW = 1790234905.0
+class ServerTestCase(unittest.TestCase):
+    """Starts one router on a free port and swaps its runtime between requests."""
 
     def setUp(self):
-        super().setUp()
-        _use({"gemini": {**REMOTE, "type": "gemini", "api_key_env": "K"}})
-        self.saved = router.BREAKERS
+        self.env = dict(os.environ)
+        os.environ.update({"TEST_GEMINI_A": "key-a", "TEST_GEMINI_B": "key-b"})
+        self.upstreams: list[FakeUpstream] = []
+        self.server = serve(make_runtime({"providers": {"placeholder": REMOTE}}),
+                            "127.0.0.1", 0)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
 
     def tearDown(self):
-        super().tearDown()
-        router.BREAKERS = self.saved
+        self.server.shutdown()
+        self.server.server_close()
+        for upstream in self.upstreams:
+            upstream.close()
+        os.environ.clear()
+        os.environ.update(self.env)
 
-    def test_quota_failure_blocks_the_tier_with_its_reason(self):
-        until = router.time.time() + 3600
-        router.record_failure("gemini", router.TierFailure("x", until, "PerDayQuota"))
+    def _use(self, tables=None, chain=None, config=None, **settings):
+        self.server.runtime = make_runtime(config or {"providers": tables}, chain,
+                                           settings=make_settings(**settings))
 
-        reason = router.tier_skip_reason("gemini")
+    def _allow(self, *hosts):
+        runtime = self.server.runtime
+        self.server.runtime = replace(
+            runtime, settings=replace(runtime.settings, allowed_hosts=tuple(hosts)))
 
-        self.assertIn("quota PerDayQuota until", reason)
-        self.assertFalse(router.tier_available("gemini"))
-        self.assertIn("quota PerDayQuota", router.breaker_snapshot()["gemini"]["reason"])
-
-    def test_breaker_cannot_shorten_a_quota_block(self):
-        until = router.time.time() + 3600
-        router.record_failure("gemini", router.TierFailure("x", until, "PerDayQuota"))
-        for _ in range(router.BREAK_AFTER):
-            router.record_failure("gemini", router.TierFailure("gemini: HTTP 503"))
-
-        self.assertIn("quota", router.tier_skip_reason("gemini"))
-
-    def test_success_clears_the_block(self):
-        router.record_failure("gemini", router.TierFailure("x", router.time.time() + 60, "q"))
-
-        router.tier_ok("gemini")
-
-        self.assertIsNone(router.tier_skip_reason("gemini"))
+    def _upstream(self, **kwargs) -> FakeUpstream:
+        upstream = FakeUpstream(**kwargs)
+        self.upstreams.append(upstream)
+        return upstream
 
 
-SPLASH_METRICS = """# HELP splash_requests_submitted_total Requests submitted.
-splash_frontend_active 0
-splash_requests_submitted_total {submitted}
-splash_requests_completed_total {completed}
-splash_requests_cancelled_total 10
-splash_requests_failed_total 0
-splash_scheduler_decoding 1
-"""
-
-
-class IdleGateTests(ActiveConfigTestCase):
-    """A provider with idle_metrics waits until every watched lane has been idle long enough."""
-
-    URL = "http://127.0.0.1:1240/metrics"
-
-    def setUp(self):
-        super().setUp()
-        _use({"remote": REMOTE,
-              "local": {**LANE, "ac_only": False, "idle_metrics": [self.URL], "idle_seconds": 30}})
-        self.local = router.PROVIDERS["local"]
-        self.saved_idle = router.IDLE
-        self.idle = router.IdleMonitor(fetch=lambda url, signal: None, sample_seconds=2.0)
-        router.IDLE = self.idle
-
-    def tearDown(self):
-        super().tearDown()
-        router.IDLE = self.saved_idle
-
-    def test_busy_lane_keeps_the_provider_out_with_a_reason(self):
-        self.idle.record(self.URL, (1011, 1), router.time.time())
-
-        allowed, skipped = router.allowed_tiers()
-
-        self.assertEqual(allowed, ["remote"])
-        self.assertIn("lanes busy (127.0.0.1:1240", skipped["local"])
-        self.assertFalse(router.idle_snapshot()["local"]["allowed"])
-
-    def test_the_sampler_watches_only_lanes_of_providers_in_the_chain(self):
-        self.assertEqual(router.watched_lanes(), (self.URL,))
-
-        _use({"remote": REMOTE, "local": {**LANE, "idle_metrics": [self.URL]}}, chain=["remote"])
-
-        self.assertEqual(router.watched_lanes(), ())
-
-    def test_gate_is_off_without_watched_lanes(self):
-        _use({"local": LANE})
-
-        self.assertIsNone(router.busy_reason(router.PROVIDERS["local"]))
-
-
-class RequestGuardTests(ActiveConfigTestCase):
+class RequestGuardTests(ServerTestCase):
     """A web page must not be able to drive the router: it takes neither a Host header that a
     rebound DNS name would carry, nor a POST that is not declared JSON."""
 
     def setUp(self):
         super().setUp()
-        self.upstream = FakeUpstream(body=completion("hi"))
-        _use({"p": {"type": "openai", "url": self.upstream.url, "model": "m"}})
-        self.saved_hosts = router.ALLOWED_HOSTS
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), router.RouterHandler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.upstream = self._upstream(body=completion("hi"))
+        self._use({"p": {"type": "openai", "url": self.upstream.url, "model": "m"}})
         self.port = self.server.server_port
-
-    def tearDown(self):
-        super().tearDown()
-        router.ALLOWED_HOSTS = self.saved_hosts
-        self.server.shutdown()
-        self.server.server_close()
-        self.upstream.close()
 
     def _call(self, method, path, headers, body=None):
         connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -381,7 +166,7 @@ class RequestGuardTests(ActiveConfigTestCase):
     def test_a_trailing_dot_does_not_change_the_host(self):
         # Rule: "localhost." is the same name as "localhost", so a browser that sends it is served;
         # a listed name is matched the same way, and another name stays refused with or without it.
-        router.ALLOWED_HOSTS = ("router.lan",)
+        self._allow("router.lan",)
         for host, expected in (("localhost.:1244", 200), ("router.lan.", 200),
                                ("evil.example.", 403)):
             with self.subTest(host):
@@ -407,16 +192,9 @@ class RequestGuardTests(ActiveConfigTestCase):
                 status, _ = self._call("GET", "/health", {"Host": host})
                 self.assertEqual(status, 200)
 
-    def test_listed_host_names_are_read_trimmed_and_lower_cased(self):
-        # Rule: OBSERVER_ROUTER_ALLOWED_HOSTS is a comma list; case and spaces do not matter.
-        settings, errors = build_settings(
-            {"OBSERVER_ROUTER_ALLOWED_HOSTS": " Router.LAN , nas.local,"})
-        self.assertEqual(errors, ())
-        self.assertEqual(settings.allowed_hosts, ("router.lan", "nas.local"))
-
     def test_a_listed_host_name_is_served(self):
         # Rule: OBSERVER_ROUTER_ALLOWED_HOSTS names the DNS names that may reach the router.
-        router.ALLOWED_HOSTS = ("router.lan",)
+        self._allow("router.lan",)
         status, _ = self._call("GET", "/health", {"Host": "Router.LAN:1244"})
         self.assertEqual(status, 200)
 
@@ -435,36 +213,12 @@ class RequestGuardTests(ActiveConfigTestCase):
         self.assertEqual(status, 200)
 
 
-class ChainTests(ActiveConfigTestCase):
+class ChainTests(ServerTestCase):
     """Requests through the router's HTTP surface fail over between named instances."""
 
-    def setUp(self):
-        super().setUp()
-        self.env = dict(router.os.environ)
-        router.os.environ.update({"TEST_GEMINI_A": "key-a", "TEST_GEMINI_B": "key-b"})
-        self.saved_breaker = router.BREAKERS
-        self.upstreams: list[FakeUpstream] = []
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), router.RouterHandler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.base = f"http://127.0.0.1:{self.server.server_port}"
-
-    def tearDown(self):
-        super().tearDown()
-        self.server.shutdown()
-        self.server.server_close()
-        for upstream in self.upstreams:
-            upstream.close()
-        router.os.environ.clear()
-        router.os.environ.update(self.env)
-        router.BREAKERS = self.saved_breaker
-
-    def _upstream(self, **kwargs) -> FakeUpstream:
-        upstream = FakeUpstream(**kwargs)
-        self.upstreams.append(upstream)
-        return upstream
 
     def _two_geminis(self, first: FakeUpstream, second: FakeUpstream) -> None:
-        _use({
+        self._use({
             "gemini-a": {"type": "gemini", "url": first.url, "model": "model-a",
                          "api_key_env": "TEST_GEMINI_A"},
             "gemini-b": {"type": "gemini", "url": second.url, "model": "model-b",
@@ -555,7 +309,7 @@ class ChainTests(ActiveConfigTestCase):
         self.assertEqual(len(second.requests), 1)
 
     def _buffered_then_fallback(self, first: FakeUpstream, fallback: FakeUpstream) -> None:
-        _use({
+        self._use({
             "lane": {"type": "openai", "url": first.url, "model": "lane", "buffer_stream": True},
             "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"},
         })
@@ -623,7 +377,7 @@ class ChainTests(ActiveConfigTestCase):
         cut = self._upstream(stream_pieces=[{"content": "partial"}],
                              finish=("length", {"prompt_tokens": 7, "completion_tokens": 3}))
         fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
-        _use({"lane": {"type": "openai", "url": cut.url, "model": "lane"},
+        self._use({"lane": {"type": "openai", "url": cut.url, "model": "lane"},
               "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
 
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -688,7 +442,7 @@ class ChainTests(ActiveConfigTestCase):
         slow = self._upstream(stream_pieces=[{"content": "a"}, {"content": "b"}, {"content": "c"}],
                               finish=("stop", {}), pace=0.6)
         fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
-        _use({"lane": {"type": "openai", "url": slow.url, "model": "lane", "buffer_stream": True,
+        self._use({"lane": {"type": "openai", "url": slow.url, "model": "lane", "buffer_stream": True,
                        "budget_s": 1},
               "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
 
@@ -736,7 +490,7 @@ class ChainTests(ActiveConfigTestCase):
         slow = self._upstream(stream_pieces=[{"content": "a"}, {"content": "b"}, {"content": "c"}],
                               finish=("stop", {}), pace=1.5)
         fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
-        _use({"lane": {"type": "openai", "url": slow.url, "model": "lane", "buffer_stream": True,
+        self._use({"lane": {"type": "openai", "url": slow.url, "model": "lane", "buffer_stream": True,
                        "budget_s": 2},
               "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
 
@@ -753,7 +507,7 @@ class ChainTests(ActiveConfigTestCase):
         late = self._upstream(stream_pieces=[{"content": "late"}], finish=("stop", {}),
                               delay=0.6, stall=3.0)
         fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
-        _use({"lane": {"type": "openai", "url": late.url, "model": "lane", "buffer_stream": True,
+        self._use({"lane": {"type": "openai", "url": late.url, "model": "lane", "buffer_stream": True,
                        "budget_s": 1},
               "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
 
@@ -770,7 +524,7 @@ class ChainTests(ActiveConfigTestCase):
         slow = self._upstream(stream_pieces=[{"content": "a"}, {"content": "b"}, {"content": "c"}],
                               finish=("stop", {}), pace=0.6)
         fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
-        _use({"lane": {"type": "openai", "url": slow.url, "model": "lane", "budget_s": 1},
+        self._use({"lane": {"type": "openai", "url": slow.url, "model": "lane", "budget_s": 1},
               "fallback": {"type": "openai", "url": fallback.url, "model": "fallback"}})
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}], "stream": True})
@@ -779,14 +533,14 @@ class ChainTests(ActiveConfigTestCase):
         self.assertEqual(fallback.requests, [])
 
     def _chars_received(self, upstream: FakeUpstream) -> int:
-        return router._message_chars(upstream.requests[0][1]["messages"])
+        return message_chars(upstream.requests[0][1]["messages"])
 
     def test_each_provider_gets_the_prompt_sized_for_it(self):
         # Rule: max_prompt_chars tightens the router-wide prompt guard for one provider; a
         # provider without it gets the full, router-bounded prompt on the same request.
         small = self._upstream(status=503, body={"error": "down"})
         large = self._upstream(body=completion("ok"))
-        _use({"small": {"type": "openai", "url": small.url, "model": "s",
+        self._use({"small": {"type": "openai", "url": small.url, "model": "s",
                         "max_prompt_chars": 3_000},
               "large": {"type": "openai", "url": large.url, "model": "l"}})
         messages = [{"role": "system", "content": "contract " * 50},
@@ -796,29 +550,30 @@ class ChainTests(ActiveConfigTestCase):
 
         self.assertEqual(status, 200)
         self.assertLessEqual(self._chars_received(small), 3_000)
-        self.assertEqual(self._chars_received(large), router._message_chars(messages))
+        self.assertEqual(self._chars_received(large), message_chars(messages))
         self.assertIn("contract", json.dumps(small.requests[0][1]["messages"]))  # system kept
 
     def test_a_group_block_logs_each_members_interval(self):
         # Rule: members with different break_seconds are skipped for different times, and the
         # log line says which.
-        router.configure(router.parse_config({
+        self._use(config={
             "chain": ["pool"],
             "providers": {
                 "a": {"type": "openai", "url": "http://h/v1", "model": "m", "break_seconds": 300},
                 "b": {"type": "openai", "url": "http://h/v1", "model": "m"}},
-            "groups": {"pool": {"members": ["a", "b"]}}}))
+            "groups": {"pool": {"members": ["a", "b"]}}})
+        runtime = self.server.runtime
 
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            router.group_overloaded("pool", "test")
+            runtime.breakers.group_overloaded("pool", "test")
 
         self.assertIn("a(300s)", out.getvalue())
-        self.assertIn(f"b({router.BREAK_SECONDS:.0f}s)", out.getvalue())
+        self.assertIn(f"b({runtime.settings.break_seconds:.0f}s)", out.getvalue())
 
     def test_a_provider_prompt_limit_above_the_request_changes_nothing(self):
         # Rule: a limit only acts on a prompt that exceeds it.
         upstream = self._upstream(body=completion("ok"))
-        _use({"p": {"type": "openai", "url": upstream.url, "model": "m",
+        self._use({"p": {"type": "openai", "url": upstream.url, "model": "m",
                     "max_prompt_chars": 50_000}})
         messages = [{"role": "user", "content": "x" * 10_000}]
 
@@ -832,7 +587,7 @@ class ChainTests(ActiveConfigTestCase):
         strict = self._upstream(status=500, body={"error": "x"})
         default = self._upstream(status=500, body={"error": "x"})
         last = self._upstream(body=completion("ok"))
-        _use({"strict": {"type": "openai", "url": strict.url, "model": "s", "break_after": 1},
+        self._use({"strict": {"type": "openai", "url": strict.url, "model": "s", "break_after": 1},
               "default": {"type": "openai", "url": default.url, "model": "d"},
               "last": {"type": "openai", "url": last.url, "model": "l"}})
 
@@ -847,7 +602,7 @@ class ChainTests(ActiveConfigTestCase):
         failing = self._upstream(status=500, body={"error": "x"})
         down = self._upstream(status=503, body={"error": "down"})
         last = self._upstream(body=completion("ok"))
-        router.configure(router.parse_config({
+        self._use(config={
             "chain": ["own", "pool", "last"],
             "providers": {
                 "own": {"type": "openai", "url": failing.url, "model": "o", "break_after": 1,
@@ -857,7 +612,7 @@ class ChainTests(ActiveConfigTestCase):
                 "last": {"type": "openai", "url": last.url, "model": "l"},
             },
             "groups": {"pool": {"members": ["member"]}},
-        }))
+        })
 
         self._post({"messages": [{"role": "user", "content": "hi"}]})
 
@@ -866,7 +621,7 @@ class ChainTests(ActiveConfigTestCase):
         self.assertAlmostEqual(breaker["member"]["skipped_for_s"], 300, delta=5)
 
     def _pool(self, first: FakeUpstream, second: FakeUpstream, fallback: FakeUpstream) -> None:
-        router.configure(router.parse_config({
+        self._use(config={
             "chain": ["pool", "fallback"],
             "providers": {
                 "gemini-a": {"type": "gemini", "url": first.url, "model": "model-a",
@@ -876,7 +631,7 @@ class ChainTests(ActiveConfigTestCase):
                 "fallback": {"type": "openai", "url": fallback.url, "model": "f"},
             },
             "groups": {"pool": {"members": ["gemini-a", "gemini-b"]}},
-        }))
+        })
 
     def test_a_group_spreads_consecutive_requests_across_its_members(self):
         first = self._upstream(body=completion("from a"))
@@ -902,9 +657,10 @@ class ChainTests(ActiveConfigTestCase):
         self.assertEqual(answers, ["from b", "from b"])
         self.assertEqual(fallback.requests, [])
 
-    def _pool_of(self, members: list[FakeUpstream], fallback: FakeUpstream, budget=12) -> None:
+    def _pool_of(self, members: list[FakeUpstream], fallback: FakeUpstream, budget=12,
+                 **settings) -> None:
         names = [f"gemini-{index}" for index in range(len(members))]
-        router.configure(router.parse_config({
+        self._use(config={
             "chain": ["pool", "fallback"],
             "providers": {
                 **{name: {"type": "gemini", "url": upstream.url, "model": name, "budget_s": budget,
@@ -913,7 +669,7 @@ class ChainTests(ActiveConfigTestCase):
                 "fallback": {"type": "openai", "url": fallback.url, "model": "f"},
             },
             "groups": {"pool": {"members": names}},
-        }))
+        }, **settings)
 
     def test_an_overloaded_member_blocks_its_whole_group(self):
         overloaded = self._upstream(status=503, body=[{"error": {
@@ -979,7 +735,7 @@ class ChainTests(ActiveConfigTestCase):
         cut = self._upstream(stream_pieces=[{"content": "echo"}],
                              finish=("length", {"completion_tokens": 4096}))
         fallback = self._upstream(stream_pieces=[{"content": "fallback"}])
-        _use({"gemini-a": {"type": "gemini", "url": cut.url, "model": "m",
+        self._use({"gemini-a": {"type": "gemini", "url": cut.url, "model": "m",
                            "api_key_env": "TEST_GEMINI_A", "buffer_stream": True},
               "fallback": {"type": "openai", "url": fallback.url, "model": "f"}})
 
@@ -990,15 +746,10 @@ class ChainTests(ActiveConfigTestCase):
     def test_the_group_strike_threshold_is_configurable(self):
         # Rule: OBSERVER_GROUP_STRIKES sets how many members must fail in a row before the group
         # is blocked; with 3, two exhausted members still leave the third to answer.
-        settings, errors = build_settings({"OBSERVER_GROUP_STRIKES": "3"})
-        self.assertEqual(errors, ())
-        self.assertEqual(settings.group_strikes, 3)
-        saved = router.GROUP_STRIKES_TO_BLOCK
-        router.GROUP_STRIKES_TO_BLOCK = 3
-        self.addCleanup(setattr, router, "GROUP_STRIKES_TO_BLOCK", saved)
         exhausted = [self._upstream(status=429, body=self.EXHAUSTED) for _ in range(2)]
         sibling = self._upstream(body=completion("sibling"))
-        self._pool_of([*exhausted, sibling], self._upstream(body=completion("fallback")))
+        self._pool_of([*exhausted, sibling], self._upstream(body=completion("fallback")),
+                      group_strikes=3)
 
         status, raw = self._post({"messages": [{"role": "user", "content": "hi"}]})
 
@@ -1062,7 +813,7 @@ class ChainTests(ActiveConfigTestCase):
     def test_health_shows_a_providers_overrides_only_when_set(self):
         # Rule: after editing the config and restarting, /health confirms what took effect.
         upstream = self._upstream(body={})
-        _use({"tuned": {"type": "openai", "url": upstream.url, "model": "m", "max_prompt_chars": 96_000,
+        self._use({"tuned": {"type": "openai", "url": upstream.url, "model": "m", "max_prompt_chars": 96_000,
                         "break_after": 2, "break_seconds": 30},
               "plain": {"type": "openai", "url": upstream.url, "model": "m"}})
 

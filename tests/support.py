@@ -77,3 +77,30 @@ class FakeUpstream:
 def completion(text):
     return {"model": "fake", "choices": [{"message": {"content": text},
                                           "finish_reason": "stop"}]}
+
+
+def make_settings(**changes):
+    """A Settings value with today's defaults, overridden per test."""
+    from observer_router.settings import Settings
+
+    fields = {"host": "127.0.0.1", "port": 1244, "allowed_hosts": (), "config_path": "",
+              "break_after": 3, "break_seconds": 60.0, "max_prompt_chars": 240_000,
+              "max_field_chars": 80_000, "min_retained_chars": 1_024,
+              "base64_blob_chars": 16_384, "power_cache_seconds": 30.0,
+              "idle_sample_seconds": 2.0, "group_strikes": 2}
+    fields.update(changes)
+    return Settings(**fields)
+
+
+def make_runtime(config, chain=None, *, settings=None, probe=None, fetch=None, log=None):
+    """A runtime for these provider tables, with the external edges pinned for a test."""
+    from observer_router.config import parse_config
+    from observer_router.log import log as default_log
+    from observer_router.runtime import Runtime
+
+    parsed = parse_config(config)
+    return Runtime.build(
+        settings or make_settings(), parsed, chain,
+        probe=probe or (lambda: "AC Power"),
+        fetch=fetch or (lambda url, signal: None),
+        log=log or default_log)

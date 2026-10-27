@@ -12,3 +12,4 @@ config.toml
 # Workflow state and disposable worktrees (zloop dispatch)
 .scratch/
 .worktrees/
+worktrees/

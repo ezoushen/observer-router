@@ -286,7 +286,7 @@ def _checked_chain(names, providers: dict, groups: dict, source: str) -> tuple[s
     return tuple(names)
 
 
-def load_config(path: str) -> Config:
+def load_config(path: str, min_retained_chars: int = 1_024) -> Config:
     try:
         with open(path, "rb") as handle:
             data = tomllib.load(handle)
@@ -294,7 +294,7 @@ def load_config(path: str) -> Config:
         raise ConfigError(f"cannot read config {path}: {error.strerror}") from None
     except tomllib.TOMLDecodeError as error:
         raise ConfigError(f"invalid TOML in {path}: {error}") from None
-    return parse_config(data)
+    return parse_config(data, min_retained_chars)
 
 
 def chain_override(config: Config, text: str) -> tuple[str, ...]:

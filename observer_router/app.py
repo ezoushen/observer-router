@@ -73,7 +73,7 @@ def main() -> None:
         log(f"environment error: {'; '.join(errors)}")
         raise SystemExit(2)
     try:
-        config = load_config(settings.config_path)
+        config = load_config(settings.config_path, settings.min_retained_chars)
         chain = chain_override(config, os.environ.get("OBSERVER_ROUTER_CHAIN", ""))
     except ConfigError as error:
         log(f"config error: {error}")

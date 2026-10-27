@@ -1,9 +1,11 @@
 """Lane activity: metric parsing, sampling, the idle decision and the serial lane lock."""
 
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 from observer_router.config import Provider
-from observer_router.idle import IdleMonitor, LaneLocks, parse_lane_metrics
+from observer_router.idle import IdleMonitor, LaneLocks, parse_lane_metrics, read_lane
 
 
 URL = "http://127.0.0.1:1240/metrics"
@@ -53,6 +55,15 @@ class MetricParsingTests(unittest.TestCase):
 
     def test_a_missing_counter_is_unreadable(self):
         self.assertIsNone(parse_lane_metrics("splash_requests_submitted_total 3\n"))
+
+    def test_a_value_that_is_not_finite_makes_the_lane_unreadable(self):
+        # Rule: NaN, infinity or an absurd number is an unreadable lane, never an exception.
+        for value in ("NaN", "+Inf", "1e400"):
+            with self.subTest(value):
+                text = SPLASH_METRICS.format(submitted=value, completed=1000)
+                self.assertIsNone(parse_lane_metrics(text))
+                gauge = f'vllm:num_requests_running {value}\nvllm:num_requests_waiting 0\n'
+                self.assertIsNone(parse_lane_metrics(gauge, VLLM_SIGNAL))
 
     def test_counters_can_be_named(self):
         text = "lane_started_total 50\nlane_done_total 40\nlane_err_total 3\n"
@@ -138,7 +149,55 @@ class IdleMonitorTests(unittest.TestCase):
         monitor.sample_once([(URL, None)])
 
         self.assertEqual(calls, [(URL, None)])
-        self.assertEqual(monitor.busy(_provider(idle_seconds=0.0)), [])
+        self.assertEqual(monitor.busy(_provider()), [URL])  # a fresh reading is activity
+
+
+class ReadLaneTests(unittest.TestCase):
+    """The real reader reads plain http only and treats every failure as no activity."""
+
+    def test_a_lane_is_read_with_its_signal(self):
+        class Metrics(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_GET(self):
+                body = VLLM_METRICS.format(running="1.0", waiting="0.0").encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Metrics)
+        Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/metrics"
+
+        self.assertEqual(read_lane(url, VLLM_SIGNAL), (None, 1))
+        self.assertIsNone(read_lane(url, None))  # the Splash names are not on this lane
+
+    def test_a_non_http_url_is_not_read(self):
+        self.assertIsNone(read_lane("file:///etc/passwd"))
+
+    def test_a_lane_answering_something_else_is_unreadable(self):
+        class Broken(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_GET(self):
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Broken)
+        Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        self.assertIsNone(read_lane(f"http://127.0.0.1:{server.server_port}/metrics"))
+
+    def test_an_unreachable_lane_is_not_activity(self):
+        self.assertIsNone(read_lane("http://127.0.0.1:9/metrics"))
 
 
 class LaneLockTests(unittest.TestCase):

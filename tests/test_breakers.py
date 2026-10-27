@@ -87,6 +87,14 @@ class QuotaResetTests(unittest.TestCase):
     def test_an_unreadable_body_states_no_quota(self):
         self.assertIsNone(quota_reset("gemini", 429, None, "not json", now=NOW))
 
+    def test_an_unreadable_or_past_reset_is_not_trusted(self):
+        # Rule: a header that is not a number, or names an epoch already passed, states no
+        # usable reset.
+        for header in ("garbage", "1000"):
+            with self.subTest(header):
+                self.assertIsNone(quota_reset("openrouter", 429,
+                                              {"X-RateLimit-Reset": header}, "{}", now=NOW))
+
 
 class BreakerTests(unittest.TestCase):
     """A tier that fails repeatedly is skipped briefly instead of spending every call on it."""

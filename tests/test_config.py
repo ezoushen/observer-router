@@ -233,6 +233,51 @@ class ConfigTests(unittest.TestCase):
                     _config(chain + text + providers)
                 self.assertIn(needle, str(caught.exception))
 
+    def test_invalid_idle_signals_are_rejected_with_the_reason(self):
+        base = ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
+                'idle_metrics = ["http://h:1/metrics"]\n')
+        cases = {
+            "without idle_metrics": (
+                '[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
+                'idle_signal = {in_flight = ["a"]}\n', "idle_signal needs idle_metrics"),
+            "both shapes": (base + 'idle_signal = {in_flight = ["a"], submitted = "b", '
+                                   'finished = ["c"]}\n', "exactly one of"),
+            "neither shape": (base + 'idle_signal = {}\n', "exactly one of"),
+            "unknown key": (base + 'idle_signal = {in_flight = ["a"], extra = 1}\n',
+                            "unknown key"),
+            "counters need finished": (base + 'idle_signal = {submitted = "a"}\n', "finished"),
+            "names must be metric names": (base + 'idle_signal = {in_flight = ["not a name"]}\n',
+                                           "metric name"),
+            "a name listed twice": (base + 'idle_signal = {submitted = "a", finished = ["b", "b"]}\n',
+                                    "more than once"),
+            "names must be a list": (base + 'idle_signal = {in_flight = "a"}\n', "list"),
+            "on a hosted type": (
+                '[providers.x]\ntype = "gemini"\nmodel = "m"\napi_key_env = "K"\n'
+                'idle_signal = {in_flight = ["a"]}\n', "for type gemini"),
+            "one url read two ways": (
+                base + 'idle_signal = {in_flight = ["a"]}\n'
+                '[providers.y]\ntype = "openai"\nurl = "http://h/v2"\nmodel = "m"\n'
+                'idle_metrics = ["http://h:1/metrics"]\n', "read two ways"),
+        }
+        for label, (text, needle) in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(ConfigError) as caught:
+                    _config(text)
+                self.assertIn(needle, str(caught.exception))
+
+    def test_load_config_passes_the_retained_floor(self):
+        # Rule: the provider floor follows the router setting, and the loader takes it.
+        text = ('[providers.x]\ntype = "openai"\nurl = "http://h/v1"\nmodel = "m"\n'
+                'max_prompt_chars = 2047\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "config.toml"
+            path.write_text(text)
+            low = load_config(str(path), min_retained_chars=0)
+            with self.assertRaises(ConfigError):
+                load_config(str(path))
+
+        self.assertEqual(low.providers["x"].max_prompt_chars, 2047)
+
     def test_removed_environment_variables_are_named(self):
         stale = stale_environment({"OBSERVER_LOCAL_URL": "x", "OBSERVER_ROUTER_PORT": "1",
                                    "OBSERVER_CURSOR_MODEL": "y", "HOME": "/h"})
@@ -263,6 +308,22 @@ class ProviderWarningTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1, warnings)
         self.assertIn("loose", warnings[0])
         self.assertIn("OBSERVER_MAX_PROMPT_CHARS", warnings[0])
+
+    def test_ac_only_on_another_host_is_warned_about(self):
+        # Rule: ac_only reads this machine's battery, so on a provider whose url names another
+        # host it cannot see that host's power; start-up says so.
+        config = parse_config({"providers": {
+            "remote-lane": {"type": "openai", "url": "http://192.0.2.7:8030/v1", "model": "m",
+                            "ac_only": True},
+            "local-lane": {"type": "openai", "url": "http://127.0.0.1:1240/v1", "model": "m",
+                           "ac_only": True},
+            "unlimited": {"type": "openai", "url": "http://192.0.2.7:8030/v1", "model": "m"}}})
+
+        warnings = provider_warnings(config.providers)
+
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("remote-lane", warnings[0])
+        self.assertIn("battery", warnings[0])
 
 
 if __name__ == "__main__":

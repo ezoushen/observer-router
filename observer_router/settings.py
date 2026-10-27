@@ -99,7 +99,8 @@ def _hosts(environ: Mapping[str, str], name: str, errors: list[str]) -> tuple[st
 def build_settings(environ: Mapping[str, str]) -> tuple[Settings, tuple[str, ...]]:
     """Return the settings this environment describes, and every error found while reading it."""
     errors: list[str] = []
-    config = environ.get("OBSERVER_ROUTER_CONFIG") or DEFAULT_CONFIG_PATH
+    config = (environ["OBSERVER_ROUTER_CONFIG"] if "OBSERVER_ROUTER_CONFIG" in environ
+              else DEFAULT_CONFIG_PATH)
     settings = Settings(
         host=environ.get("OBSERVER_ROUTER_HOST", "127.0.0.1"),
         port=_int(environ, "OBSERVER_ROUTER_PORT", 1244, 1, 65535, errors),

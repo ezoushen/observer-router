@@ -136,10 +136,15 @@ These are recorded, not started. Do not act on any of them without the owner's a
 - In plugin **13.24.8** the observation queue is **in-memory**. `pending_messages` in the database
   is vestigial — nothing writes it. A worker restart discards queued work, so the retry cushion
   holds only while the worker process stays up.
-- Plugin **15.2.1** (running since at least 2026-10-26) asks observers for `max_tokens` 4096 at
-  temperature 0.3 and streams them. Its stream idle timeout, `CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS`
-  (90 s), runs from the request until the router's response headers arrive, so every failed
-  attempt before the answering one counts against it. It stores the complete blocks of a reply cut
-  off at `finish_reason: length`, which is why the router serves one when no other tier answers.
+- Plugin **15.4.0** (updated 2026-10-28 12:12) asks observers for `max_tokens` 4096 (default of
+  `CLAUDE_MEM_OBSERVER_MAX_OUTPUT_TOKENS`) at temperature 0.3 and streams them. Its stream idle
+  timeout, `CLAUDE_MEM_LLM_STREAM_IDLE_TIMEOUT_MS` (90 s), runs from the request until the router's
+  response headers arrive, so every failed attempt before the answering one counts against it. It
+  stores the complete blocks of a reply cut off at `finish_reason: length`, which is why the router
+  serves one when no other tier answers.
+- The same plugin's My Work summarizer is **not streamed**: temperature 0.15, `max_tokens` 5000,
+  reasoning disabled, `response_format: {"type":"json_object"}`, under a 90 s abort. It keeps two
+  cards in flight and retries a card every 60 s with an identical body and no backoff, which is the
+  loop repeat rotation exists to absorb.
 - `--prompt-cache-bytes` is not enforced in mlx_lm's streaming insertion path; sequence count is
   the effective bound on the lane's cache.

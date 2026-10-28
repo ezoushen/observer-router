@@ -26,7 +26,7 @@ class SettingsTests(unittest.TestCase):
             break_after=3, break_seconds=60.0, max_prompt_chars=240_000,
             max_field_chars=80_000, min_retained_chars=1_024, base64_blob_chars=16_384,
             power_cache_seconds=30.0, idle_sample_seconds=2.0, group_strikes=2,
-            request_deadline_seconds=85.0,
+            request_deadline_seconds=85.0, repeat_window_seconds=600.0,
         ))
         self.assertEqual(errors, ())
 
@@ -46,6 +46,7 @@ class SettingsTests(unittest.TestCase):
             "OBSERVER_IDLE_SAMPLE_SECONDS": "0.5",
             "OBSERVER_GROUP_STRIKES": "4",
             "OBSERVER_REQUEST_DEADLINE_SECONDS": "60",
+            "OBSERVER_REPEAT_WINDOW_SECONDS": "0",
             "OBSERVER_ROUTER_CONFIG": "~/custom.toml",
             "OBSERVER_ROUTER_ALLOWED_HOSTS": " Router.LAN , nas.local,",
         })
@@ -63,6 +64,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.idle_sample_seconds, 0.5)
         self.assertEqual(settings.group_strikes, 4)
         self.assertEqual(settings.request_deadline_seconds, 60.0)
+        self.assertEqual(settings.repeat_window_seconds, 0.0)
         self.assertEqual(settings.config_path, os.path.expanduser("~/custom.toml"))
         self.assertEqual(settings.allowed_hosts, ("router.lan", "nas.local"))
 
@@ -84,6 +86,8 @@ class SettingsTests(unittest.TestCase):
                                                     "request_deadline_seconds", 85.0),
             "deadline under a second": ("OBSERVER_REQUEST_DEADLINE_SECONDS", "0.5",
                                         "request_deadline_seconds", 85.0),
+            "negative repeat window": ("OBSERVER_REPEAT_WINDOW_SECONDS", "-1",
+                                       "repeat_window_seconds", 600.0),
             "negative seconds": ("OBSERVER_BREAK_SECONDS", "-1", "break_seconds", 60.0),
             "infinite seconds": ("OBSERVER_IDLE_SAMPLE_SECONDS", "inf", "idle_sample_seconds", 2.0),
             "port out of range": ("OBSERVER_ROUTER_PORT", "70000", "port", 1244),

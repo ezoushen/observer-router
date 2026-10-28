@@ -95,6 +95,7 @@ Integer settings stop at 1,000,000,000.
 | `OBSERVER_ROUTER_ALLOWED_HOSTS` | none | comma-separated DNS names, besides `localhost` and IP literals, accepted in a request's `Host` header; see [security](security.md) |
 | `OBSERVER_BREAK_AFTER` / `OBSERVER_BREAK_SECONDS` | `3` / `60` | an integer ≥ 1 / seconds ≥ 1 |
 | `OBSERVER_REQUEST_DEADLINE_SECONDS` | `85` | seconds, 1–86400: how long after its arrival a request may still be answered ([request deadline](routing.md#the-request-deadline)) |
+| `OBSERVER_REPEAT_WINDOW_SECONDS` | `600` | seconds, 0–86400: how long the entries that answered a request are tried last when the identical request comes again; `0` turns this off ([repeated requests](routing.md#repeated-requests)) |
 | `OBSERVER_GROUP_STRIKES` | `2` | an integer ≥ 1: group members failing in a row, by timeout or unexplained 429, that block the group |
 | `OBSERVER_POWER_CACHE_SECONDS` | `30` | seconds ≥ 0 |
 | `OBSERVER_IDLE_SAMPLE_SECONDS` | `2` | seconds, 0.1–3600 |

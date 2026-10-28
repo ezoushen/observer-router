@@ -87,7 +87,8 @@ def make_settings(**changes):
               "break_after": 3, "break_seconds": 60.0, "max_prompt_chars": 240_000,
               "max_field_chars": 80_000, "min_retained_chars": 1_024,
               "base64_blob_chars": 16_384, "power_cache_seconds": 30.0,
-              "idle_sample_seconds": 2.0, "group_strikes": 2, "request_deadline_seconds": 85.0}
+              "idle_sample_seconds": 2.0, "group_strikes": 2, "request_deadline_seconds": 85.0,
+              "repeat_window_seconds": 600.0}
     fields.update(changes)
     return Settings(**fields)
 

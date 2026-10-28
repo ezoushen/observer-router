@@ -4,6 +4,19 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-28 — repeated requests go to another model
+
+### Added
+
+- **A repeated request tries the chain entries that have not answered it first.** For
+  `OBSERVER_REPEAT_WINDOW_SECONDS` (600 s) after each answer, the router remembers which chain
+  entry answered each request body. An identical request then goes to the other entries first;
+  the ones that answered are tried last, not skipped, and a group counts as one entry. claude-mem
+  15.3.0 resends a My Work summary its validator refused every 60 s with an identical body. At
+  night the identical request went back to the MBP-14 lane, the only tier with quota, which
+  repeated the mistake: one card was sent 498 times from 2026-10-27 16:14, about 55 times an hour
+  overnight. See [repeated requests](docs/reference/routing.md#repeated-requests).
+
 ## 2026-10-28 — the lane's model, measured
 
 ### Research

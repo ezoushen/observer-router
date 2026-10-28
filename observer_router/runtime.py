@@ -18,6 +18,7 @@ from observer_router.idle import IdleMonitor, LaneLocks, read_lane
 from observer_router.log import log as default_log
 from observer_router.power import PowerGate, probe_power
 from observer_router.prompt import PromptGuard, PromptLimits
+from observer_router.repeats import Repeats
 from observer_router.settings import Settings
 
 Log = Callable[[str], None]
@@ -39,6 +40,7 @@ class Runtime:
     idle: IdleMonitor
     guard: PromptGuard
     lanes: LaneLocks
+    repeats: Repeats
     rotation: dict[str, int] = field(default_factory=dict)
     _rotation_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -63,6 +65,7 @@ class Runtime:
                                            settings.min_retained_chars,
                                            settings.base64_blob_chars), log),
             lanes=LaneLocks(),
+            repeats=Repeats(settings.repeat_window_seconds),
         )
 
     @property
@@ -91,6 +94,30 @@ class Runtime:
                 self.rotation[name] = start + 1
                 order += members[start:] + members[:start]
         return order
+
+    def chain_entry(self, name: str) -> str:
+        """The chain entry a provider is reached through: its group, or itself."""
+        return self.breakers.group_of(name) or name
+
+    def request_order(self, key: str) -> tuple[list[str], list[str]]:
+        """This request's provider order, and the chain entries that already answered it.
+
+        A client repeating a request it got an answer to did not accept that answer, so the
+        entries that gave one are tried after the rest, the one that answered longest ago first.
+        """
+        order = self.expand_chain()
+        answered = self.repeats.answered(key)
+        if not answered:
+            return order, []
+        rank = {entry: index for index, entry in enumerate(answered)}
+        fresh = [name for name in order if self.chain_entry(name) not in rank]
+        tried = sorted((name for name in order if self.chain_entry(name) in rank),
+                       key=lambda name: rank[self.chain_entry(name)])
+        return fresh + tried, answered
+
+    def answered(self, key: str, name: str) -> None:
+        """Remember that this provider's chain entry answered the request with this key."""
+        self.repeats.record(key, self.chain_entry(name))
 
     def busy_lanes(self, provider: Provider, now: float | None = None) -> list[str]:
         return self.idle.busy(provider, now)

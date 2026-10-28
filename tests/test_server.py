@@ -742,8 +742,9 @@ class ChainTests(ServerTestCase):
         fallback = self._upstream(body=completion("fallback"))
         self._pool(first, second, fallback)
 
-        answers = [json.loads(self._post({"messages": [{"role": "user", "content": "hi"}]})[1])
-                   ["choices"][0]["message"]["content"] for _ in range(4)]
+        # Distinct requests: an identical one would go to the entries that have not answered it.
+        answers = [json.loads(self._post({"messages": [{"role": "user", "content": f"hi {n}"}]})[1])
+                   ["choices"][0]["message"]["content"] for n in range(4)]
 
         self.assertEqual(sorted(answers), ["from a", "from a", "from b", "from b"])
         self.assertEqual(fallback.requests, [])
@@ -754,8 +755,8 @@ class ChainTests(ServerTestCase):
         fallback = self._upstream(body=completion("fallback"))
         self._pool(first, second, fallback)
 
-        answers = [json.loads(self._post({"messages": [{"role": "user", "content": "hi"}]})[1])
-                   ["choices"][0]["message"]["content"] for _ in range(2)]
+        answers = [json.loads(self._post({"messages": [{"role": "user", "content": f"hi {n}"}]})[1])
+                   ["choices"][0]["message"]["content"] for n in range(2)]
 
         self.assertEqual(answers, ["from b", "from b"])
         self.assertEqual(fallback.requests, [])
@@ -935,6 +936,57 @@ class ChainTests(ServerTestCase):
         self.assertEqual(health["chain"], ["gemini-a", "gemini-b"])
         self.assertEqual(health["providers"]["gemini-b"],
                          {"type": "gemini", "model": "model-b", "budget_s": 18.0})
+
+
+class RepeatTests(ServerTestCase):
+    """A client that sends an identical request again did not take the answer it got: the
+    request goes to the chain entries that have not answered it yet."""
+
+    _post = ChainTests._post
+    _streamed_text = staticmethod(ChainTests._streamed_text)
+
+    def _chain(self, stream=False, second_status=200, **settings):
+        def upstream(text, status=200):
+            if stream:
+                return self._upstream(status=status, stream_pieces=[{"content": text}])
+            return self._upstream(status=status, body=completion(text))
+        self.first, self.second = upstream("first"), upstream("second", second_status)
+        self._use({"first": {"type": "openai", "url": self.first.url, "model": "first"},
+                   "second": {"type": "openai", "url": self.second.url, "model": "second"}},
+                  **settings)
+
+    def _text(self, body):
+        status, raw = self._post(body)
+        self.assertEqual(status, 200)
+        if body.get("stream"):
+            return self._streamed_text(raw)
+        return json.loads(raw)["choices"][0]["message"]["content"]
+
+    def test_an_identical_request_goes_to_the_entry_that_has_not_answered_it(self):
+        # Rule: on both paths the answers rotate through the chain, and a different request
+        # still starts at the head of the chain.
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                self._chain(stream)
+                body = {"messages": [{"role": "user", "content": "card"}], "stream": stream}
+                answers = [self._text(body) for _ in range(3)]
+                self.assertEqual(answers, ["first", "second", "first"])
+                other = {**body, "messages": [{"role": "user", "content": "another"}]}
+                self.assertEqual(self._text(other), "first")
+
+    def test_a_tried_entry_still_answers_when_the_others_fail(self):
+        # Rule: an entry that answered before is tried last, not skipped.
+        self._chain(second_status=500)
+        body = {"messages": [{"role": "user", "content": "card"}]}
+
+        self.assertEqual([self._text(body) for _ in range(2)], ["first", "first"])
+        self.assertEqual(len(self.second.requests), 1)
+
+    def test_a_zero_window_keeps_the_configured_order(self):
+        self._chain(repeat_window_seconds=0)
+        body = {"messages": [{"role": "user", "content": "card"}]}
+
+        self.assertEqual([self._text(body) for _ in range(2)], ["first", "first"])
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ Start with the [README](../README.md) to get a router running. Everything else i
 | Reference | What it covers |
 | --- | --- |
 | [Configuration](reference/configuration.md) | Every config-file field and environment setting, with defaults and accepted values |
-| [Routing and streaming](reference/routing.md) | What counts as an answer or a failed attempt, cut-off replies, the streaming contract, buffered streams |
+| [Routing and streaming](reference/routing.md) | What counts as an answer or a failed attempt, cut-off replies, repeated requests, the streaming contract, buffered streams |
 | [Breakers, quota blocks, and group blocks](reference/breakers-and-quotas.md) | When a provider or a whole group is skipped, and for how long |
 | [Prompt guard](reference/prompt-guard.md) | How every request is bounded before any provider sees it |
 | [GPU-lane gates](reference/gates.md) | The AC-power and idle rules for local lanes |

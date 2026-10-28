@@ -1,6 +1,7 @@
 # Routing and streaming
 
-What counts as an answer, what counts as a failed attempt, and how a streamed reply commits.
+What counts as an answer, what counts as a failed attempt, how a repeated request is routed, and
+how a streamed reply commits.
 
 ## Tier behaviour
 
@@ -56,6 +57,25 @@ stream is closed without waiting for the rest of it; OpenRouter names it on ever
 text reaches the client first. A stream that names its model only after its first text has
 committed by then, and ends as a failed stream. The rule names models, not content, so it holds
 for any client.
+
+## Repeated requests
+
+A client that sends a request again after getting an answer did not take that answer: its own
+check refused the reply, and it is asking again. The same chain would give the identical request
+to the same model, which tends to make the same mistake every time. So the router remembers, for
+`OBSERVER_REPEAT_WINDOW_SECONDS` (600 s) after each answer, which chain entries answered a request:
+
+- **An identical request tries the other entries first**, in chain order. The entries that
+  answered it follow, the one that answered longest ago first, so repeats rotate through the
+  chain.
+- **They are tried last, not skipped.** When every other entry fails, one of them still answers.
+- **A group counts as one entry**: its members serve one model, so another key would give the
+  same answer.
+- **Identical means the same JSON body**, field order aside. Any difference, including a changed
+  prompt or temperature, makes a new request.
+
+The router never reads the reply to judge it, so this holds for any client. The service log shows
+`repeated request: <entries> answered it already, tried last`. `0` turns the rule off.
 
 ## The request deadline
 

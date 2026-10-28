@@ -164,6 +164,36 @@ class BreakerTests(unittest.TestCase):
         self.assertEqual(runtime.skip_reason("gemini"), "breaker-open")
 
 
+class RepeatTests(unittest.TestCase):
+    """A request the client sends again goes to the chain entries that have not answered it."""
+
+    def test_entries_that_answered_an_identical_request_are_tried_last(self):
+        # Rule: the other entries keep their order; the ones that answered follow, the one
+        # that answered longest ago first.
+        runtime = make_runtime({**POOL, "chain": ["local", "pool"]})
+        runtime.answered("k", "local")
+
+        self.assertEqual(runtime.request_order("k"), (["a", "b", "c", "local"], ["local"]))
+        self.assertEqual(runtime.request_order("other"), (["local", "b", "c", "a"], []))
+
+    def test_a_group_member_answering_moves_the_whole_group(self):
+        # Rule: a group's members serve one model, so another key would give the same answer.
+        runtime = make_runtime(POOL)
+        runtime.answered("k", "b")
+
+        order, answered = runtime.request_order("k")
+
+        self.assertEqual(answered, ["pool"])
+        self.assertEqual(order[0], "local")
+        self.assertEqual(sorted(order[1:]), ["a", "b", "c"])
+
+    def test_a_zero_window_keeps_the_configured_order(self):
+        runtime = make_runtime(POOL, settings=make_settings(repeat_window_seconds=0))
+        runtime.answered("k", "local")
+
+        self.assertEqual(runtime.request_order("k"), (["a", "b", "c", "local"], []))
+
+
 class IsolationTests(unittest.TestCase):
     """Two runtimes share nothing: a test can build its own and leave no state behind."""
 

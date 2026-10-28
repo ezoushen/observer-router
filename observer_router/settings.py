@@ -31,7 +31,8 @@ class Settings:
     Character counts bound a prompt; seconds are wall-clock intervals; `port` is the TCP port
     the HTTP surface binds and `allowed_hosts` the extra DNS names a request's Host header may
     carry. `config_path` is the TOML file start-up reads. `request_deadline_seconds` is how long
-    after its arrival a request may still be answered.
+    after its arrival a request may still be answered; `repeat_window_seconds` how long the
+    entries that answered a request are tried last when the identical request comes again.
     """
 
     host: str
@@ -48,6 +49,7 @@ class Settings:
     idle_sample_seconds: float
     group_strikes: int
     request_deadline_seconds: float
+    repeat_window_seconds: float
 
 
 def _bound(minimum: float, maximum: float) -> str:
@@ -126,5 +128,7 @@ def build_settings(environ: Mapping[str, str]) -> tuple[Settings, tuple[str, ...
         # A day at most: a serial lane's lock cannot wait past threading.TIMEOUT_MAX.
         request_deadline_seconds=_float(environ, "OBSERVER_REQUEST_DEADLINE_SECONDS", 85.0, 1.0,
                                         86_400.0, errors),
+        repeat_window_seconds=_float(environ, "OBSERVER_REPEAT_WINDOW_SECONDS", 600.0, 0.0,
+                                     86_400.0, errors),
     )
     return settings, tuple(errors)

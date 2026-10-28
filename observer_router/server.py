@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from observer_router.failure import TierFailure
 from observer_router.log import log
+from observer_router.repeats import request_key
 from observer_router.runtime import Runtime
 from observer_router.upstream import iter_stream, nonstream
 
@@ -153,6 +154,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": "messages must be an array"})
             return
 
+        key = request_key(body)  # as sent: compaction is deterministic, so a repeat compacts alike
         body = dict(body)
         body["messages"], compacted = self.runtime.compact(body["messages"])
         self.runtime.record_compaction(compacted)
@@ -166,17 +168,20 @@ class RouterHandler(BaseHTTPRequestHandler):
                 f"removed_blobs={compacted['removed_blobs']}"
             )
 
-        order = self.runtime.expand_chain()  # once per request: every expansion advances the group rotation
+        # Once per request: every expansion advances the group rotation.
+        order, answered = self.runtime.request_order(key)
+        if answered:
+            log(f"repeated request: {','.join(answered)} answered it already, tried last")
         # One deadline for the whole chain: a reply later than the client waits reaches no one.
         deadline = self._arrived + self.runtime.settings.request_deadline_seconds
         if body.get("stream"):
-            self._stream(body, order, deadline)
+            self._stream(body, order, deadline, key)
         else:
-            self._once(body, order, deadline)
+            self._once(body, order, deadline, key)
 
     # --- streaming path -------------------------------------------------------
 
-    def _stream(self, body: dict, order: list[str], deadline: float) -> None:
+    def _stream(self, body: dict, order: list[str], deadline: float, key: str) -> None:
         attempted = []
         salvage = None  # (tier, (model, text)) of the first reply cut off at the token limit
         allowed, skipped = self.runtime.allowed_tiers(order)
@@ -207,6 +212,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 continue
 
             # First content delta is in hand: commit to this tier and stop buffering.
+            self.runtime.answered(key, tier)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -239,6 +245,7 @@ class RouterHandler(BaseHTTPRequestHandler):
 
         if salvage:
             tier, (served, text) = salvage
+            self.runtime.answered(key, tier)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -257,7 +264,7 @@ class RouterHandler(BaseHTTPRequestHandler):
 
     # --- non-streaming path ---------------------------------------------------
 
-    def _once(self, body: dict, order: list[str], deadline: float) -> None:
+    def _once(self, body: dict, order: list[str], deadline: float, key: str) -> None:
         attempted = []
         salvage = None  # (tier, (model, text)) of the first reply cut off at the token limit
         allowed, skipped = self.runtime.allowed_tiers(order)
@@ -283,6 +290,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             served = payload.get("model") or tier
             choice = (payload.get("choices") or [{}])[0]
             self.runtime.ok(tier)
+            self.runtime.answered(key, tier)
             log(
                 f"served tier={tier} model={served} "
                 f"latency={time.time() - started:.2f}s "
@@ -303,6 +311,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         if salvage:
             tier, (served, text) = salvage
+            self.runtime.answered(key, tier)
             log(f"served tier={tier} model={served} cut off, no later tier answered stream=0")
             self._json(200, {
                 "id": "chatcmpl-router",

@@ -73,11 +73,13 @@ measurement record; no record file carries a weights field.
 | Qwen3.5-4B OptiQ | `mlx-community/Qwen3.5-4B-OptiQ-4bit` | 2.9 GB | `locals` |
 | Gemma 4 12B OptiQ | `mlx-community/gemma-4-12B-it-OptiQ-4bit` | ~6.7 GB | `locals` |
 | MiniCPM5-2B | `mlx-community/MiniCPM5-2B-mlx-4Bit` | 1.3 GB | `locals` |
+| LFM3-VL-2B | `LiquidAI/LFM3-VL-2B` (GGUF `Q4_K_M`) | 1.5 GB | `llama.cpp` built `19ff817` |
 
-The last three are extensions, measured only where the core three leave a real gap. LFM3 has no MLX
-loader: `mlx-lm` 0.32.2 and its upstream main hold no `lfm3` architecture, so it is served by llama.cpp,
-whose LFM3 support merged on 2026-10-27 and whose release `b11935` published after it. Its speed is
-therefore not comparable to `locals`; its quality on identical prompts is.
+The last four are extensions, measured only where the core three leave a real gap. Neither LFM3
+candidate has an MLX loader: `mlx-lm` 0.32.2 and its upstream main hold no `lfm3` architecture, so
+both are served by llama.cpp, whose LFM3 support merged on 2026-10-27 and whose release `b11935`
+published after it. Their speed is therefore not comparable to `locals`; their quality on identical
+prompts is.
 
 ### Scoring
 
@@ -210,13 +212,15 @@ What the counters say:
 
 ### The extension candidates
 
-Two more were measured because the core comparison left two live questions: whether a much smaller,
-faster model keeps the recall, and whether a larger Gemma is more faithful than the E4B.
+Three more were measured because the core comparison left live questions: whether a much smaller,
+faster model keeps the recall, whether a larger Gemma is more faithful than the E4B, and whether the
+vision-capable LFM3 variant behaves better than the text one.
 
 | Model | Missed known-worthy | Observations | Complete | Invented paths | Truncated | Wall p50 | Summary `Oz` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | minicpm5-2b | 0/36 | 34 | 100% | 41% | 0% | 4.6 s | 8/12 |
 | gemma-4-12b | 9/36 | 27 | 100% | 26% | 0% | 42.4 s | 10/12 |
+| lfm3-vl-2b | 0/36 | 36 | 78% | 36% | 0% | 6.4 s | 0/12 |
 
 - **MiniCPM5-2B is the fastest and the least accurate.** It never skips and answers with TTFT of
   0.4-0.7 s at 68 tokens/s, but 41% of its observations carry a path the input never contained, and
@@ -303,6 +307,13 @@ Rejected successors, with the evidence:
   paths, and truncates replies at the cap.
 - **MiniCPM5-2B** is fast and never skips, but 41% of its observations cite a path the input never
   contained, and two replies came back as tool calls instead of observations.
+- **LFM3-VL-2B is fast and fluent, and fails both workloads.** It never skips and decodes at 94
+  tokens/s after a 2.2 s load, but 13 of its 36 observations cite a path the input never contained
+  and 8 miss a required field. Every one of the 12 summary cards fails `Oz`: on the zero-workstream
+  card it invents `{"id":"1", …}`, and on the array-looking id it splits the literal string into
+  `tensorfold-local` and drops the rest. It was measured after the cutover, with `mbp14` out of the
+  chain, so the numbers are uncontended; its first 32k load failed with `Insufficient Memory` while
+  the live Gemma lane was resident.
 
 Nothing was changed while this was measured: the chain read `gemini, openrouter, ornith, cursor` and
 MBP-14's own lane served Qwen3.5-4B. The owner then authorized the cutover, and at 09:20 on 2026-10-28

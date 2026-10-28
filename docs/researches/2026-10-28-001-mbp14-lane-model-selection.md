@@ -304,6 +304,9 @@ Rejected successors, with the evidence:
 - **MiniCPM5-2B** is fast and never skips, but 41% of its observations cite a path the input never
   contained, and two replies came back as tool calls instead of observations.
 
-Nothing was changed. The live chain still reads `gemini, openrouter, ornith, cursor`, the router
-configuration is untouched, and MBP-14's own lane still serves Qwen3.5-4B on `:8030`. The cutover is
-the owner's decision.
+Nothing was changed while this was measured: the chain read `gemini, openrouter, ornith, cursor` and
+MBP-14's own lane served Qwen3.5-4B. The owner then authorized the cutover, and at 09:20 on 2026-10-28
+MBP-14's lane began serving Gemma 4 E4B, the chain returned `mbp14` in place of `ornith`, and
+`min_budget_s` became 25. The
+[journal entry](../journals/2026-10-28-001-mbp14-gemma-cutover.md) records what changed and how to
+revert it.

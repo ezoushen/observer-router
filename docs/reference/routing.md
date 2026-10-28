@@ -74,7 +74,9 @@ to the same model, which tends to make the same mistake every time. So the route
 - **Identical means the same JSON body**, field order aside. Any difference, including a changed
   prompt or temperature, makes a new request.
 
-The router never reads the reply to judge it, so this holds for any client. The service log shows
+A client that resends a request because it stopped waiting, not because it refused the answer,
+also gets the other entries first; their failed attempts count against its timeout. The router
+never reads the reply to judge it, so this holds for any client. The service log shows
 `repeated request: <entries> answered it already, tried last`. `0` turns the rule off.
 
 ## The request deadline

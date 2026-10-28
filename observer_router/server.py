@@ -154,7 +154,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": "messages must be an array"})
             return
 
-        key = request_key(body)  # as sent: compaction is deterministic, so a repeat compacts alike
+        # As sent: compaction is deterministic, so a repeat compacts alike. No digest when off.
+        key = request_key(body) if self.runtime.settings.repeat_window_seconds else ""
         body = dict(body)
         body["messages"], compacted = self.runtime.compact(body["messages"])
         self.runtime.record_compaction(compacted)
@@ -212,12 +213,12 @@ class RouterHandler(BaseHTTPRequestHandler):
                 continue
 
             # First content delta is in hand: commit to this tier and stop buffering.
-            self.runtime.answered(key, tier)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            self.runtime.answered(key, tier)  # once the client has the headers
             try:
                 for _, piece in generator:
                     self._chunk(self._sse_delta(served, piece))
@@ -245,12 +246,12 @@ class RouterHandler(BaseHTTPRequestHandler):
 
         if salvage:
             tier, (served, text) = salvage
-            self.runtime.answered(key, tier)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
+            self.runtime.answered(key, tier)
             try:
                 self._chunk(self._sse_delta(served, text))
                 self._chunk(self._sse_delta(served, "", "length"))

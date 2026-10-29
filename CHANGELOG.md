@@ -8,8 +8,9 @@ carries them.
 
 ### Changed
 
-- **The `mbp14` provider serves `locals/lfm3-observer-q6`, behind a reconciliation shim.** The lane
-  runs an LFM3-1.7B fine-tuned on claude-mem's own observations and summaries at 6 bits. The shim
+- **The `mbp14` provider serves `locals/lfm3-1.7b-cmem-summarizer-q6`, behind a reconciliation
+  shim.** The lane runs an LFM3-1.7B fine-tuned on claude-mem's own observations and summaries at
+  6 bits. The shim
   repairs summary replies — workstream ids reconciled against what the request supplied — before
   claude-mem validates them, because the router itself stays client-agnostic. Measured solo on the
   M1 against the 36/12 sample: 36/36 observers accepted, 1 skipped against Gemma's 4, 12/12 summary
@@ -18,8 +19,13 @@ carries them.
 - **The lane holds one model.** The 16 GB machine cannot keep two resident: doing so drove the lane
   into Metal OOM, which invalidated the first measurement rather than reflecting the model.
 
+- **The model was renamed to `lfm3-1.7b-cmem-summarizer`** later the same day, together with its
+  Hugging Face repository, lane directory, adapter and merged weights. The old name described only
+  the observer half of the model's work.
+
 The evidence and the two corrected measurements are in
-[journals/2026-10-29-001](docs/journals/2026-10-29-001-mbp14-lfm3-cutover.md), and the corpus,
+[journals/2026-10-29-001](docs/journals/2026-10-29-001-mbp14-lfm3-cutover.md), the rename in
+[journals/2026-10-29-003](docs/journals/2026-10-29-003-cmem-summarizer-rename.md), and the corpus,
 training and shim live in the sibling `lfm-summarizer` repository.
 
 ## 2026-10-28 — repeated requests go to another model

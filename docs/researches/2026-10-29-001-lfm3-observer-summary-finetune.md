@@ -81,6 +81,36 @@ whose inputs cannot be rebuilt: the card builder exists only inside the plugin's
 and no request body is retained. Provenance matters too — 271 of 525 valid copies came from
 `locals/qwen3.5-4b`, the lane whose failures repeat rotation exists to absorb.
 
+## Correction: the first verdict measured the wrong mode
+
+The verdict below was reached before three defects in the measurement were found. Each one depressed
+LFM3's scores and none of them affects Gemma, which does not emit separate reasoning.
+
+1. **Reasoning was on.** The template defaults `enable_thinking = true` and `mlx_lm.server` ignores
+   the `reasoning: {enabled: false}` field that production always sends on summary requests, so every
+   run scored a mode production never asks for. On observer requests, the budget went to reasoning
+   and the content came back empty: five of the combined adapter's failures were zero-length replies.
+   Passing `chat_template_kwargs: {enable_thinking: false}` took observers from 30/36 to 36/36 with
+   no truncations.
+2. **Workstream ids were never reconciled.** The harness scored the raw object. When a card supplies
+   no workstreams the correct answer is an empty array, and when it supplies one the id is an opaque
+   stringified JSON array that the model likes to rewrite. Filtering returned ids to the supplied set
+   is deterministic: it lifted summaries from 2/12 to 11/12 at q8 and 3/12 to 12/12 at q6.
+3. **Invented paths** were already corrected above.
+
+Re-scored in production mode, on the same 36/12 sample:
+
+| Model | Observers | Missed worthy | Complete | Invented | Truncated | p50 / p90 / TTFT | Summaries raw | Summaries reconciled |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Gemma 4 E4B | 36/36 | 4/36 | 32/32 | 0 | 0 | 13.08 / 19.94 / 5.66 s | 11/12 | 11/12 |
+| Combined v2 q8 | 36/36 | 6/36 | 30/30 | 0 | 0 | 6.90 / 11.44 / 0.70 s | 2/12 | 11/12 |
+| Combined v2 q6 | 35/36 | 3/36 | 32/32 | 0 | 1 | 7.28 / 15.06 / 0.63 s | 3/12 | 12/12 |
+
+Both serving-layer changes are prerequisites, not tuning: without the reasoning switch observers
+fall to 30/36, and without reconciliation no summary clears its ids. Neither belongs in the router,
+which must stay client-agnostic: honouring a generic reasoning flag is provider adaptation, but
+reconciling `workstreams` ids is claude-mem's schema.
+
 ## Conclusion
 
 - **The observer half is a genuine win**: 35/36 accepted at q6 against Gemma's 36/36, but 1/36
@@ -93,10 +123,15 @@ and no request body is retained. Provenance matters too — 271 of 525 valid cop
 - **The observer win cannot ship alone.** The lane answers both request kinds with one model, and
   routing by request shape would put claude-mem-specific logic in a router that must stay
   client-agnostic.
-- Therefore the lane stays on Gemma 4 E4B.
+- **In production mode the fine-tune meets the agreed bar**, given two lane-side changes. Without
+  them it does not: raw summaries stay at 2–3/12 and observers at 30/36.
+- The lane therefore cannot simply swap models. Either the lane learns to honour the reasoning flag
+  and reconcile summary ids, or it stays on Gemma 4 E4B.
 
 ## What would change this answer
 
+- A lane that honours `reasoning: {enabled: false}` and reconciles summary ids against the request.
+  Both are demonstrated above and neither is a model change.
 - A larger base model, or one already competent at strict JSON, so that capacity is not the limit.
 - A summary corpus an order of magnitude larger, with inputs retained at request time so a card's
   history can be replayed.

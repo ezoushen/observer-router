@@ -43,3 +43,4 @@ in the wider workspace is untouched.
 
 - Current behaviour of the router — that is the README.
 - Chronological work log — that is `docs/journals/`.
+| 2026-10-29 | [LFM3 fine-tune for the MBP-14 lane](2026-10-29-001-lfm3-observer-summary-finetune.md) | Can a fine-tuned small local model beat Gemma 4 E4B on observer calls *and* summaries? (No: the observer half wins, the summarizer does not, and one adapter must serve both.) |

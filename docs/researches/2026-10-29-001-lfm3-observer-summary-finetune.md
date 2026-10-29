@@ -106,6 +106,23 @@ Re-scored in production mode, on the same 36/12 sample:
 | Combined v2 q8 | 36/36 | 6/36 | 30/30 | 0 | 0 | 6.90 / 11.44 / 0.70 s | 2/12 | 11/12 |
 | Combined v2 q6 | 35/36 | 3/36 | 32/32 | 0 | 1 | 7.28 / 15.06 / 0.63 s | 3/12 | 12/12 |
 
+A second independent draw over the same sample, with a different seed salt, shows how wide the
+sampling error is:
+
+| Draw | Accepted | Missed worthy | Complete | Truncated | p50 / p90 | Summaries raw | Reconciled |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| q8 #1 | 36/36 | 6/36 | 30/30 | 0 | 6.90 / 11.44 s | 2/12 | 11/12 |
+| q8 #2 | 36/36 | 10/36 | 26/26 | 0 | 2.15 / 4.27 s | 2/12 | 12/12 |
+| q6 #1 | 35/36 | 3/36 | 32/32 | 1 | 7.28 / 15.06 s | 3/12 | 12/12 |
+| q6 #2 | 35/36 | 4/36 | 31/31 | 1 | 2.16 / 3.28 s | 3/12 | 11/12 |
+
+Three readings matter. A single draw must not be read as a ranking: q8 skipped 6 then 10 worthy
+observations, so differences of a few cards are noise. q6 skipped fewer in both draws, which looks
+real, but it also degenerated once per draw, and that one reply is what inflates its p90 — within a
+draw the medians are identical. And latency is only comparable within a draw: a second run in the
+same session is roughly three times faster, because MLX kernel compilation and the page cache are
+already warm.
+
 Both serving-layer changes are prerequisites, not tuning: without the reasoning switch observers
 fall to 30/36, and without reconciliation no summary clears its ids. Neither belongs in the router,
 which must stay client-agnostic: honouring a generic reasoning flag is provider adaptation, but

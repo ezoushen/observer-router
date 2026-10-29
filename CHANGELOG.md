@@ -4,6 +4,24 @@ Notable changes to this repository, newest first. Dates are the day the change l
 Documentation moves are listed here; behaviour changes are listed under the release that
 carries them.
 
+## 2026-10-29 — the MBP-14 lane serves a fine-tuned LFM3
+
+### Changed
+
+- **The `mbp14` provider serves `locals/lfm3-observer-q6`, behind a reconciliation shim.** The lane
+  runs an LFM3-1.7B fine-tuned on claude-mem's own observations and summaries at 6 bits. The shim
+  repairs summary replies — workstream ids reconciled against what the request supplied — before
+  claude-mem validates them, because the router itself stays client-agnostic. Measured solo on the
+  M1 against the 36/12 sample: 36/36 observers accepted, 1 skipped against Gemma's 4, 12/12 summary
+  cards against 11/12, whole-reply p50 7.3 s and p90 9.9 s against 13.1 and 19.9.
+- **`min_budget_s` on `mbp14` falls from 25 to 20,** on a measured maximum whole-reply time of 18.7 s.
+- **The lane holds one model.** The 16 GB machine cannot keep two resident: doing so drove the lane
+  into Metal OOM, which invalidated the first measurement rather than reflecting the model.
+
+The evidence and the two corrected measurements are in
+[journals/2026-10-29-001](docs/journals/2026-10-29-001-mbp14-lfm3-cutover.md), and the corpus,
+training and shim live in the sibling `lfm-summarizer` repository.
+
 ## 2026-10-28 — repeated requests go to another model
 
 ### Added

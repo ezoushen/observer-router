@@ -3,8 +3,11 @@
 Question: can a fine-tune of a small local model serve this lane's observer calls *and* its My Work
 summaries well enough to replace Gemma 4 E4B?
 
-Answer: no. The observer half is better than the live lane on recall, completeness and latency, but
-the summarizer stays far below it, and one adapter has to serve both workloads.
+Answer: yes, given two lane-side changes: reasoning off, and summary ids reconciled against the
+request. The first answer was no. The observer half beat the live lane on recall, completeness and
+latency, but the summarizer stayed far below it, and one adapter has to serve both workloads. Two
+measurement defects had depressed those scores and a third overcounted invented paths; the
+correction below sets them out.
 
 ## Why the question was worth asking
 
